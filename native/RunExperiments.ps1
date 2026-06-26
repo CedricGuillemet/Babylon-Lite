@@ -1,7 +1,11 @@
 $exeFiles = @(
     @{
-        Path = ".\dawn\app.exe"
-        Args = @("native-lite-benchmark.lite.js", "--no-vsync", "--frames", "1000")
+        Path = ".\dawn\app-d3d12.exe"
+        Args = @("native-lite-benchmark.lite.js", "--width", "640", "--height", "400", "--no-vsync", "--frames", "1000")
+    },
+    @{
+        Path = ".\dawn\app-d3d11.exe"
+        Args = @("native-lite-benchmark.lite.js", "--width", "640", "--height", "400", "--no-vsync", "--frames", "1000")
     }
 )
 
