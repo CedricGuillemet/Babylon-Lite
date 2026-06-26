@@ -7,6 +7,13 @@
         "mobile": true
     },
     {
+        "slug": "native-lite-benchmark",
+        "name": "NativeLiteBenchmark",
+        "description": "Draw-call stress test: the Khronos BoomBox glTF (PBR) is loaded once and deep-cloned into a 20\u00d720 grid (400 individual meshes, one draw call each, sharing the source GPU buffers), lit by an HDR environment with a cascaded-shadow-map directional sun casting onto a ground plane.",
+        "tags": ["benchmark", "showcase"],
+        "mobile": false
+    },
+    {
         "slug": "torus-states",
         "name": "Torus States",
         "description": "Fullscreen WGSL raymarched twisted-torus SDF that auto-morphs through 7 states, renders through a scene-less Lite frame graph, and pipes the result through bloom. No scene, camera, or mesh; just an effect render task plus post-process chain focused on bundle size. Reproduction of Robert Penner's demo.",
