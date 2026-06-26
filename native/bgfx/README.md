@@ -16,6 +16,11 @@ An alternative native host for the **Experiment 1 — BoomBox grid benchmark** (
 The rendered scene is identical to the reference: BoomBox loaded once, cloned into a 20×20
 grid of 400 individual meshes (no instancing), casting CSM shadows onto a ground plane.
 
+See **[`IMPLEMENTATION.md`](./IMPLEMENTATION.md)** for the architecture, the Babylon Native
+foundations (threading model, JsRuntimeHost, polyfills), the JS-bundle-size comparison, the
+maintenance-cost trade-off, and the full performance + binary-size table (incl. the lesson that
+our first native build was ~2.8× *slower* than the reference until we added shadow-map caching).
+
 ## Run
 
 From `native/` run `./RunExperiments.ps1` (it launches all hosts), or directly:
