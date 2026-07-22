@@ -30,7 +30,9 @@ add_library(mesh-lod-tool-core STATIC
     src/cli.cpp
     src/input.cpp
     src/normalize.cpp
-    src/hierarchy.cpp)
+    src/hierarchy.cpp
+    src/crc32c.cpp
+    src/sha256.cpp)
 target_include_directories(mesh-lod-tool-core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include

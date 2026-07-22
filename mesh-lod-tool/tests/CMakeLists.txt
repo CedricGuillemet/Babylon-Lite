@@ -30,3 +30,10 @@ set_tests_properties(cli_version_cgltf_pin PROPERTIES
 
 add_test(NAME cli_unknown_arg COMMAND mesh-lod-tool --nope)
 set_tests_properties(cli_unknown_arg PROPERTIES WILL_FAIL TRUE)
+
+# Binary-format layout and integrity (CRC32C / SHA-256 / fingerprint) vectors.
+add_executable(mesh-lod-format-tests format_tests.cpp)
+target_link_libraries(mesh-lod-format-tests PRIVATE mesh-lod-tool-core)
+target_include_directories(mesh-lod-format-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+mlod_set_project_warnings(mesh-lod-format-tests)
+add_test(NAME format_vectors COMMAND mesh-lod-format-tests)
