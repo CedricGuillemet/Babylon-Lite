@@ -2,6 +2,7 @@
 
 #include "cli.h"
 #include "normalize.h"
+#include "sha256.h"
 
 #if defined(_MSC_VER)
 #pragma warning(push, 0)
@@ -12,7 +13,10 @@
 #pragma warning(pop)
 #endif
 
+#include <array>
 #include <cstdint>
+#include <cstring>
+#include <fstream>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -290,7 +294,7 @@ int readPrimitive(std::uint32_t meshIndex, std::uint32_t primitiveIndex,
 } // namespace
 
 int loadSourcePrimitives(const ConversionOptions& options, std::vector<SourcePrimitive>& out,
-                         std::ostream& err) {
+                         std::ostream& err, std::array<std::uint8_t, 32>* sourceDigest) {
     const std::string& input = options.inputPath;
 
     cgltf_options parseOptions = {};
@@ -371,13 +375,37 @@ int loadSourcePrimitives(const ConversionOptions& options, std::vector<SourcePri
         out.push_back(std::move(primitiveOut));
     }
 
-    cgltf_free(data);
-
     if (out.empty()) {
+        cgltf_free(data);
         err << "error: " << input << ": no primitives found to convert\n";
         return kExitMalformed;
     }
 
+    if (sourceDigest != nullptr) {
+        std::ifstream file(input, std::ios::binary);
+        if (!file) {
+            cgltf_free(data);
+            err << "error: " << input << ": could not reopen input for hashing\n";
+            return kExitIo;
+        }
+        std::vector<unsigned char> mainBytes((std::istreambuf_iterator<char>(file)),
+                                             std::istreambuf_iterator<char>());
+        std::vector<SourcePart> parts;
+        parts.push_back({mainBytes.data(), mainBytes.size()});
+        // External geometry buffers (not embedded data URIs, not GLB binary) are
+        // hashed after the main file; images are not cgltf buffers and so are
+        // excluded automatically.
+        for (cgltf_size b = 0; b < data->buffers_count; ++b) {
+            const cgltf_buffer& buffer = data->buffers[b];
+            if (buffer.uri != nullptr && std::strncmp(buffer.uri, "data:", 5) != 0 &&
+                buffer.data != nullptr) {
+                parts.push_back({buffer.data, buffer.size});
+            }
+        }
+        *sourceDigest = computeSourceDigest(parts);
+    }
+
+    cgltf_free(data);
     return kExitSuccess;
 }
 

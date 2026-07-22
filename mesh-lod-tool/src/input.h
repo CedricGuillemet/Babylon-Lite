@@ -4,6 +4,7 @@
 #include "cli.h"
 #include "normalize.h"
 
+#include <array>
 #include <cstdint>
 #include <ostream>
 #include <string>
@@ -23,10 +24,11 @@ struct SelectedPrimitive {
 // primitive), and reads each selected primitive into a SourcePrimitive with its
 // material facts. Rejects every unsupported source feature/layout with an
 // explicit diagnostic that includes mesh/primitive/accessor/extension context.
-// Returns kExitSuccess, or an ExitCode (2 selection, 3 I/O, 4 malformed,
-// 5 unsupported).
+// When sourceDigest is non-null it receives the length-prefixed SHA-256 over the
+// input file bytes plus any external geometry buffers. Returns kExitSuccess, or
+// an ExitCode (2 selection, 3 I/O, 4 malformed, 5 unsupported).
 int loadSourcePrimitives(const ConversionOptions& options, std::vector<SourcePrimitive>& out,
-                         std::ostream& err);
+                         std::ostream& err, std::array<std::uint8_t, 32>* sourceDigest = nullptr);
 
 // Derives the sibling output path for a single primitive by inserting
 // ".meshNNN.primNNN" (three-digit, zero-padded source indices) before the

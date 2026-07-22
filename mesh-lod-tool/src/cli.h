@@ -60,6 +60,14 @@ int parseConversionOptions(const std::vector<std::string>& args, ConversionOptio
 // Used later for provenance and reproducibility hashing.
 std::string canonicalConversionOptions(const ConversionOptions& options);
 
+// Runs the full conversion pipeline for already-validated options: load and hash
+// the source, then for every selected primitive normalize, build the hierarchy,
+// pack pages, and write + independently validate the container in memory. Emits
+// statistics and, unless --validate-only, atomically publishes all outputs so
+// nothing is written unless every selected primitive validates. Returns an
+// ExitCode.
+int runConversion(const ConversionOptions& options, std::ostream& out, std::ostream& err);
+
 // Full command-line entry: resolves --help/--version, parses and validates
 // convert-mode options, and dispatches conversion. Returns an ExitCode.
 int runCli(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);

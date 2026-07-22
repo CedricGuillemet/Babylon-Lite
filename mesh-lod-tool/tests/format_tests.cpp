@@ -4,9 +4,11 @@
 #include "input.h"
 #include "mlod_format.h"
 #include "mlod_version.h"
+#include "mlod_writer.h"
 #include "normalize.h"
 #include "page_packer.h"
 #include "sha256.h"
+#include "validator.h"
 
 #include <array>
 #include <cmath>
@@ -340,6 +342,73 @@ void testPagePacking() {
     }
 }
 
+int writeGridContainer(std::vector<unsigned char>& bytes) {
+    mlod::ConversionOptions options;
+    mlod::NormalizedPrimitive normalized;
+    mlod::PrimitiveHierarchy hierarchy;
+    mlod::PackedGeometry packed;
+    if (buildPacked("grid.gltf", options, normalized, hierarchy, packed) != mlod::kExitSuccess) {
+        return -1;
+    }
+    std::array<std::uint8_t, 32> digest{};
+    std::ostringstream errStream;
+    return mlod::writeContainer(hierarchy, packed, normalized, options, digest, bytes, errStream);
+}
+
+void testWriteValidate() {
+    std::vector<unsigned char> bytes;
+    expect(writeGridContainer(bytes) == mlod::kExitSuccess, "grid container writes");
+    std::ostringstream errStream;
+    expect(mlod::validateContainer(bytes.data(), bytes.size(), errStream) == mlod::kExitSuccess,
+           "written container reparses and validates");
+
+    // Determinism at the container level.
+    std::vector<unsigned char> bytes2;
+    expect(writeGridContainer(bytes2) == mlod::kExitSuccess, "grid container re-writes");
+    expect(bytes == bytes2, "two writes are byte-identical");
+
+    const auto rejects = [&](std::vector<unsigned char> mutated, const std::string& what) {
+        std::ostringstream local;
+        expect(mlod::validateContainer(mutated.data(), mutated.size(), local) ==
+                   mlod::kExitValidation,
+               what);
+    };
+
+    // Header field mutation breaks the header CRC.
+    std::vector<unsigned char> headerMutated = bytes;
+    headerMutated[mlod::header::kBoundsMin] ^= 0x01;
+    rejects(headerMutated, "header mutation fails validation");
+
+    // Version mutation is rejected before the CRC check.
+    std::vector<unsigned char> versionMutated = bytes;
+    mlod::le::writeU16(versionMutated.data() + mlod::header::kFormatMajor, 2);
+    rejects(versionMutated, "format version mutation fails validation");
+
+    // Directory mutation breaks the directory CRC.
+    const std::uint64_t directoryOffset = mlod::le::readU64(bytes.data() + mlod::header::kDirectoryOffset);
+    std::vector<unsigned char> directoryMutated = bytes;
+    directoryMutated[directoryOffset + 8] ^= 0x01;
+    rejects(directoryMutated, "directory mutation fails validation");
+
+    // Section-body mutation breaks that section's CRC (groups is directory entry 1).
+    const std::uint64_t groupOffset =
+        mlod::le::readU64(bytes.data() + directoryOffset + mlod::kSectionEntrySize +
+                          mlod::section_entry::kOffset);
+    std::vector<unsigned char> sectionMutated = bytes;
+    sectionMutated[groupOffset] ^= 0x01;
+    rejects(sectionMutated, "section mutation fails validation");
+
+    // Page-data mutation (including zero padding) breaks a per-page CRC.
+    std::vector<unsigned char> pageMutated = bytes;
+    pageMutated[pageMutated.size() - 1] ^= 0x01;
+    rejects(pageMutated, "page mutation fails validation");
+
+    // Truncation is rejected.
+    std::vector<unsigned char> truncated = bytes;
+    truncated.pop_back();
+    rejects(truncated, "truncation fails validation");
+}
+
 } // namespace
 
 int main() {
@@ -351,6 +420,7 @@ int main() {
     testSourceDigest();
     testBuildFingerprint();
     testPagePacking();
+    testWriteValidate();
 
     if (g_failures == 0) {
         std::cout << "all mesh-lod-tool format tests passed\n";

@@ -3,7 +3,11 @@
 #include "hierarchy.h"
 #include "input.h"
 #include "mlod_version.h"
+#include "validator.h"
 
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -438,6 +442,79 @@ void testHierarchy() {
            "validation rejects an over-limit cluster");
 }
 
+std::vector<unsigned char> readFile(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::vector<unsigned char>((std::istreambuf_iterator<char>(file)),
+                                      std::istreambuf_iterator<char>());
+}
+
+int convert(const std::string& fixtureName, const std::string& outputPath, bool validateOnly) {
+    mlod::ConversionOptions options;
+    options.inputPath = fixture(fixtureName);
+    options.outputPath = outputPath;
+    options.validateOnly = validateOnly;
+    std::ostringstream outStream;
+    std::ostringstream errStream;
+    return mlod::runConversion(options, outStream, errStream);
+}
+
+void testEndToEnd() {
+    namespace fs = std::filesystem;
+
+    // Single-primitive conversion writes exactly one container that revalidates.
+    const std::string gridOut = "e2e_grid.mlod";
+    fs::remove(gridOut);
+    expect(convert("grid.gltf", gridOut, false) == mlod::kExitSuccess, "grid converts end to end");
+    expect(fs::exists(gridOut), "grid output is written");
+    std::vector<unsigned char> gridBytes = readFile(gridOut);
+    std::ostringstream errStream;
+    expect(mlod::validateContainer(gridBytes.data(), gridBytes.size(), errStream) ==
+               mlod::kExitSuccess,
+           "written grid container validates from disk");
+
+    // Determinism: a second conversion is byte-identical on disk.
+    const std::string gridOut2 = "e2e_grid2.mlod";
+    fs::remove(gridOut2);
+    expect(convert("grid.gltf", gridOut2, false) == mlod::kExitSuccess, "grid converts again");
+    expect(readFile(gridOut2) == gridBytes, "two conversions are byte-identical on disk");
+
+    // --validate-only writes nothing.
+    const std::string validateOut = "e2e_validate.mlod";
+    fs::remove(validateOut);
+    expect(convert("grid.gltf", validateOut, true) == mlod::kExitSuccess, "validate-only succeeds");
+    expect(!fs::exists(validateOut), "validate-only writes no output");
+
+    // Multi-primitive conversion publishes one sibling container per primitive.
+    const std::string multiOut = "e2e_multi.mlod";
+    const std::string multi0 = "e2e_multi.mesh000.prim000.mlod";
+    const std::string multi1 = "e2e_multi.mesh001.prim000.mlod";
+    fs::remove(multi0);
+    fs::remove(multi1);
+    expect(convert("two_primitives.gltf", multiOut, false) == mlod::kExitSuccess,
+           "two-primitive file converts");
+    expect(fs::exists(multi0) && fs::exists(multi1), "both sibling outputs are published");
+    expect(!fs::exists(multiOut), "the base name is not written for multi-output");
+
+    // A whole-file conversion with an unsupported primitive fails and leaves no
+    // output files (atomic behavior).
+    const std::string mixedOut = "e2e_mixed.mlod";
+    const std::string mixed0 = "e2e_mixed.mesh000.prim000.mlod";
+    const std::string mixed1 = "e2e_mixed.mesh001.prim000.mlod";
+    for (const std::string& path : {mixedOut, mixed0, mixed1}) {
+        fs::remove(path);
+    }
+    expect(convert("mixed.gltf", mixedOut, false) == mlod::kExitUnsupported,
+           "mixed file conversion fails as unsupported");
+    expect(!fs::exists(mixedOut) && !fs::exists(mixed0) && !fs::exists(mixed1),
+           "failed multi-output leaves no files");
+
+    // Clean up test artifacts and any stray temporaries.
+    for (const std::string& path :
+         {gridOut, gridOut2, multi0, multi1, gridOut + ".tmp", multi0 + ".tmp", multi1 + ".tmp"}) {
+        fs::remove(path);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -450,6 +527,7 @@ int main() {
     testCanonicalOptions();
     testIngestion();
     testHierarchy();
+    testEndToEnd();
 
     if (g_failures == 0) {
         std::cout << "all mesh-lod-tool CLI tests passed\n";

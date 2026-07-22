@@ -33,7 +33,10 @@ add_library(mesh-lod-tool-core STATIC
     src/hierarchy.cpp
     src/crc32c.cpp
     src/sha256.cpp
-    src/page_packer.cpp)
+    src/page_packer.cpp
+    src/mlod_writer.cpp
+    src/validator.cpp
+    src/statistics.cpp)
 target_include_directories(mesh-lod-tool-core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include

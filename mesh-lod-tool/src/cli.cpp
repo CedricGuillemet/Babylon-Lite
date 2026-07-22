@@ -1,12 +1,21 @@
 #include "cli.h"
 
+#include "hierarchy.h"
 #include "input.h"
 #include "mlod_version.h"
+#include "mlod_writer.h"
+#include "normalize.h"
+#include "page_packer.h"
+#include "statistics.h"
+#include "validator.h"
 
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <ostream>
 #include <set>
 #include <string>
@@ -331,6 +340,116 @@ std::vector<std::string> deriveOutputPaths(const std::string& baseOutput,
     return paths;
 }
 
+int runConversion(const ConversionOptions& options, std::ostream& out, std::ostream& err) {
+    std::vector<SourcePrimitive> primitives;
+    std::array<std::uint8_t, 32> sourceDigest{};
+    int rc = loadSourcePrimitives(options, primitives, err, &sourceDigest);
+    if (rc != kExitSuccess) {
+        return rc;
+    }
+
+    std::vector<SelectedPrimitive> selection;
+    selection.reserve(primitives.size());
+    for (const SourcePrimitive& primitive : primitives) {
+        selection.push_back({primitive.meshIndex, primitive.primitiveIndex});
+    }
+    const std::vector<std::string> outputs = deriveOutputPaths(options.outputPath, selection);
+
+    std::vector<PrimitiveHierarchy> hierarchies(primitives.size());
+    std::vector<PackedGeometry> packs(primitives.size());
+    std::vector<std::vector<unsigned char>> images(primitives.size());
+    for (std::size_t i = 0; i < primitives.size(); ++i) {
+        NormalizedPrimitive normalized;
+        rc = normalizePrimitive(primitives[i], normalized, err);
+        if (rc != kExitSuccess) {
+            return rc;
+        }
+        rc = buildHierarchy(normalized, options, hierarchies[i], err);
+        if (rc != kExitSuccess) {
+            return rc;
+        }
+        rc = packPages(hierarchies[i], normalized, options, packs[i], err);
+        if (rc != kExitSuccess) {
+            return rc;
+        }
+        rc = writeContainer(hierarchies[i], packs[i], normalized, options, sourceDigest, images[i],
+                            err);
+        if (rc != kExitSuccess) {
+            return rc;
+        }
+        rc = validateContainer(images[i].data(), images[i].size(), err);
+        if (rc != kExitSuccess) {
+            return rc;
+        }
+    }
+
+    if (!options.statsJsonPath.empty()) {
+        const std::string json = buildStatisticsJson(hierarchies, packs);
+        std::ofstream statsFile(options.statsJsonPath, std::ios::binary | std::ios::trunc);
+        if (!statsFile) {
+            err << "error: could not write statistics to " << options.statsJsonPath << "\n";
+            return kExitIo;
+        }
+        statsFile.write(json.data(), static_cast<std::streamsize>(json.size()));
+        if (!statsFile) {
+            err << "error: could not write statistics to " << options.statsJsonPath << "\n";
+            return kExitIo;
+        }
+    }
+    writeStatisticsText(hierarchies, packs, out);
+
+    if (options.validateOnly) {
+        return kExitSuccess;
+    }
+
+    // Atomic publish: write every output to a sibling temporary first, then
+    // rename each into place. A failure before all temporaries are written leaves
+    // no final files.
+    namespace fs = std::filesystem;
+    std::vector<std::string> temporaries(outputs.size());
+    const auto cleanup = [&]() {
+        for (const std::string& temporary : temporaries) {
+            if (!temporary.empty()) {
+                std::error_code ec;
+                fs::remove(temporary, ec);
+            }
+        }
+    };
+
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        temporaries[i] = outputs[i] + ".tmp";
+        std::ofstream file(temporaries[i], std::ios::binary | std::ios::trunc);
+        if (!file) {
+            err << "error: could not create " << temporaries[i] << "\n";
+            cleanup();
+            return kExitWrite;
+        }
+        file.write(reinterpret_cast<const char*>(images[i].data()),
+                   static_cast<std::streamsize>(images[i].size()));
+        file.close();
+        if (!file) {
+            err << "error: could not write " << temporaries[i] << "\n";
+            cleanup();
+            return kExitWrite;
+        }
+    }
+
+    for (std::size_t i = 0; i < outputs.size(); ++i) {
+        std::error_code ec;
+        fs::remove(outputs[i], ec);
+        fs::rename(temporaries[i], outputs[i], ec);
+        if (ec) {
+            err << "error: could not publish " << outputs[i] << "\n";
+            cleanup();
+            return kExitWrite;
+        }
+        temporaries[i].clear();
+        out << "wrote " << outputs[i] << "\n";
+    }
+
+    return kExitSuccess;
+}
+
 int runCli(const std::vector<std::string>& args, std::ostream& out, std::ostream& err) {
     // --help and --version are handled first and independently of position so
     // they work without input files (REQ-TOOL-5, REQ-TOOL-6).
@@ -356,10 +475,7 @@ int runCli(const std::vector<std::string>& args, std::ostream& out, std::ostream
         return parseResult;
     }
 
-    // Arguments are fully validated. Geometry ingestion, hierarchy generation,
-    // page packing, and .mlod writing are delivered by subsequent tasks.
-    err << "error: conversion pipeline is not yet implemented\n";
-    return kExitIo;
+    return runConversion(options, out, err);
 }
 
 } // namespace mlod
