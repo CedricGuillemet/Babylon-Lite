@@ -359,5 +359,14 @@ export function disposeMeshLoDAsset(asset: MeshLoDAsset): void {
     runtime.generation += 1;
     runtime.abortController.abort();
     runtime.gpu?.arena.buffer.destroy?.();
+    const sel = runtime.gpuSelection;
+    if (sel) {
+        sel.nodeBuffer.destroy?.();
+        sel.groupBuffer.destroy?.();
+        sel.clusterBuffer.destroy?.();
+        sel.pageRefBuffer.destroy?.();
+        sel.pageStateBuffer.destroy?.();
+        runtime.gpuSelection = null;
+    }
     asset.state = "disposed";
 }

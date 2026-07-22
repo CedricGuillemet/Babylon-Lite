@@ -34,6 +34,7 @@ export interface MockDevice {
     createBindGroup(desc: unknown): object;
     createPipelineLayout(desc: unknown): object;
     createRenderPipeline(desc: unknown): object;
+    createComputePipeline(desc: unknown): { getBindGroupLayout(index: number): object };
     readonly queue: {
         writeBuffer(buffer: MockBuffer, offset: number, data: ArrayBuffer | ArrayBufferView, dataOffset?: number, size?: number): void;
         writeTexture(...args: unknown[]): void;
@@ -83,6 +84,9 @@ export function createMockDevice(limitBytes = 1024 * 1024 * 1024): MockDevice {
         createRenderPipeline() {
             return {};
         },
+        createComputePipeline() {
+            return { getBindGroupLayout: () => ({}) };
+        },
         queue: {
             writeBuffer(buffer, offset, data, dataOffset = 0, size) {
                 const byteLength = size ?? (ArrayBuffer.isView(data) ? data.byteLength - dataOffset : (data as ArrayBuffer).byteLength - dataOffset);
@@ -117,9 +121,94 @@ export function createMockRenderPass(): MockRenderPass {
     };
 }
 
-/** Wrap a mock device as an `EngineContext` for the loader. */
-export function createMockEngine(device: MockDevice = createMockDevice()): { engine: EngineContext; device: MockDevice } {
-    return { engine: { _device: device } as unknown as EngineContext, device };
+/** A recorded compute dispatch (direct or indirect). */
+export interface MockComputeDispatch {
+    readonly kind: "direct" | "indirect";
+    readonly workgroups?: number;
+    readonly indirectBuffer?: MockBuffer;
+    readonly indirectOffset?: number;
+}
+
+/** A mock compute-pass encoder that records dispatch commands. */
+export interface MockComputePass {
+    readonly dispatches: MockComputeDispatch[];
+    readonly setBindGroups: { index: number }[];
+    setPipeline(pipeline: unknown): void;
+    setBindGroup(index: number, group: unknown): void;
+    dispatchWorkgroups(x: number): void;
+    dispatchWorkgroupsIndirect(buffer: MockBuffer, offset: number): void;
+    end(): void;
+}
+
+export interface BufferCopy {
+    readonly src: MockBuffer;
+    readonly srcOffset: number;
+    readonly dst: MockBuffer;
+    readonly dstOffset: number;
+    readonly size: number;
+}
+
+export interface BufferClear {
+    readonly buffer: MockBuffer;
+    readonly offset: number;
+    readonly size?: number;
+}
+
+/** A mock command encoder recording buffer copies/clears and compute passes. */
+export interface MockEncoder {
+    readonly copies: BufferCopy[];
+    readonly clears: BufferClear[];
+    readonly computePasses: MockComputePass[];
+    copyBufferToBuffer(src: MockBuffer, srcOffset: number, dst: MockBuffer, dstOffset: number, size: number): void;
+    clearBuffer(buffer: MockBuffer, offset?: number, size?: number): void;
+    beginComputePass(): MockComputePass;
+}
+
+export function createMockEncoder(): MockEncoder {
+    const copies: BufferCopy[] = [];
+    const clears: BufferClear[] = [];
+    const computePasses: MockComputePass[] = [];
+    return {
+        copies,
+        clears,
+        computePasses,
+        copyBufferToBuffer(src, srcOffset, dst, dstOffset, size) {
+            copies.push({ src, srcOffset, dst, dstOffset, size });
+        },
+        clearBuffer(buffer, offset = 0, size) {
+            clears.push({ buffer, offset, size });
+        },
+        beginComputePass() {
+            const dispatches: MockComputeDispatch[] = [];
+            const setBindGroups: { index: number }[] = [];
+            const pass: MockComputePass = {
+                dispatches,
+                setBindGroups,
+                setPipeline() {},
+                setBindGroup(index) {
+                    setBindGroups.push({ index });
+                },
+                dispatchWorkgroups(x) {
+                    dispatches.push({ kind: "direct", workgroups: x });
+                },
+                dispatchWorkgroupsIndirect(indirectBuffer, indirectOffset) {
+                    dispatches.push({ kind: "indirect", indirectBuffer, indirectOffset });
+                },
+                end() {},
+            };
+            computePasses.push(pass);
+            return pass;
+        },
+    };
+}
+
+/** Wrap a mock device as an `EngineContext` for the loader. Attaches a recording
+ *  command encoder as `_currentEncoder` so make-before-break growth and compute
+ *  submission can be asserted. */
+export function createMockEngine(device: MockDevice = createMockDevice()): { engine: EngineContext; device: MockDevice; encoder: MockEncoder } {
+    const encoder = createMockEncoder();
+    const engine = { _device: device, _currentEncoder: encoder, _retirements: null } as unknown as EngineContext;
+    return { engine, device, encoder };
 }
 
 /** A decoder that fills decoded vertex bytes with zeros and index bytes with a

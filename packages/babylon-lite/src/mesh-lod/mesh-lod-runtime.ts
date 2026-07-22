@@ -23,6 +23,7 @@ import type { MeshLoDArena } from "./mesh-lod-cache.js";
 import { allocateArenaRun, arenaUsedBytes, createMeshLoDArena, floorToBlocks, pinnedAllocationBytes } from "./mesh-lod-cache.js";
 import { decodeMeshLoDPage, getMeshLoDPageDecoder } from "./mesh-lod-page-decoder.js";
 import { addMeshLoDInstanceToScene, removeMeshLoDInstanceFromScene } from "./mesh-lod-scene.js";
+import type { MeshLoDGpuAssetBuffers } from "./mesh-lod-selection-gpu.js";
 /** Effective, fully-resolved runtime settings (defaults applied, values validated). */
 export interface MeshLoDEffectiveSettings {
     screenSpaceError: number;
@@ -208,6 +209,9 @@ export interface MeshLoDAssetRuntime {
     readonly groupPageRefs: Uint32Array;
     /** Immutable geometry arena and per-page residency (pinned coarse pages GPU-resident at resolve). */
     readonly gpu: MeshLoDGpuState;
+    /** Shared per-asset GPU selection buffers (immutable hierarchy + mutable page state).
+     *  Built lazily on the first GPU selection; `null` until then and after device change. */
+    gpuSelection: MeshLoDGpuAssetBuffers | null;
     readonly settings: MeshLoDEffectiveSettings;
     /** Live diagnostics object also referenced by `MeshLoDAsset.diagnostics`. */
     readonly diagnostics: MeshLoDDiagnostics;
@@ -389,6 +393,7 @@ export async function _loadMeshLoD(
         pageRecords: parsed.pageRecords,
         groupPageRefs: parsed.groupPageRefs,
         gpu,
+        gpuSelection: null,
         settings,
         diagnostics,
         abortController: new AbortController(),

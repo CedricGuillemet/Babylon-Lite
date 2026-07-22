@@ -12,13 +12,10 @@
  *  column 3 (`m[12..14]`) is the translation. */
 
 import type { MeshLoDCluster, MeshLoDGroup, MeshLoDHierarchyNode, MeshLoDPageRecord } from "./mesh-lod-runtime.js";
+import type { MeshLoDFrustumPlane, ProjectedSphere } from "./mesh-lod-selection-math.js";
+import { fadd, fmul, fsub, maxColumnScale, perspectivePixelScale, projectSphere, sphereOutsidePlanes } from "./mesh-lod-selection-math.js";
 
-const f32 = Math.fround;
-const fadd = (a: number, b: number): number => f32(a + b);
-const fsub = (a: number, b: number): number => f32(a - b);
-const fmul = (a: number, b: number): number => f32(a * b);
-const fdiv = (a: number, b: number): number => f32(a / b);
-const fsqrt = (a: number): number => f32(Math.sqrt(a));
+export type { MeshLoDFrustumPlane } from "./mesh-lod-selection-math.js";
 
 /** Camera + projection inputs. Perspective by default; set `orthographicHeight > 0`
  *  to use the orthographic screen-space-error equation. */
@@ -30,10 +27,6 @@ export interface MeshLoDCamera {
     readonly targetHeight: number;
     readonly orthographicHeight?: number;
 }
-
-/** A normalized frustum plane `[nx, ny, nz, d]`; the inside half-space is
- *  `n·p + d >= 0`. */
-export type MeshLoDFrustumPlane = readonly [number, number, number, number];
 
 export interface MeshLoDSelectionInput {
     readonly groups: readonly MeshLoDGroup[];
@@ -75,55 +68,19 @@ export interface MeshLoDSelectionResult {
     readonly maximumUnmetErrorPixels: number;
 }
 
-interface Projected {
-    readonly worldCenter: readonly [number, number, number];
-    readonly worldRadius: number;
-    readonly errorPx: number;
-    readonly projectedRadiusPx: number;
-}
-
-function maxColumnScale(m: readonly number[]): number {
-    const c0 = fsqrt(fadd(fadd(fmul(m[0]!, m[0]!), fmul(m[1]!, m[1]!)), fmul(m[2]!, m[2]!)));
-    const c1 = fsqrt(fadd(fadd(fmul(m[4]!, m[4]!), fmul(m[5]!, m[5]!)), fmul(m[6]!, m[6]!)));
-    const c2 = fsqrt(fadd(fadd(fmul(m[8]!, m[8]!), fmul(m[9]!, m[9]!)), fmul(m[10]!, m[10]!)));
-    return Math.max(c0, c1, c2);
-}
-
-function project(input: MeshLoDSelectionInput, worldScale: number, pixelScale: number, center: readonly [number, number, number], radius: number, error: number): Projected {
-    const m = input.worldMatrix;
-    const wx = fadd(fadd(fmul(m[0]!, center[0]), fmul(m[4]!, center[1])), fadd(fmul(m[8]!, center[2]), m[12]!));
-    const wy = fadd(fadd(fmul(m[1]!, center[0]), fmul(m[5]!, center[1])), fadd(fmul(m[9]!, center[2]), m[13]!));
-    const wz = fadd(fadd(fmul(m[2]!, center[0]), fmul(m[6]!, center[1])), fadd(fmul(m[10]!, center[2]), m[14]!));
-    const worldRadius = fmul(radius, worldScale);
-    const worldError = fmul(error, worldScale);
-    const dx = fsub(input.camera.position[0], wx);
-    const dy = fsub(input.camera.position[1], wy);
-    const dz = fsub(input.camera.position[2], wz);
-    const distance = fsqrt(fadd(fadd(fmul(dx, dx), fmul(dy, dy)), fmul(dz, dz)));
-    const surfaceDistance = Math.max(fsub(distance, worldRadius), input.camera.near);
-
-    const ortho = input.camera.orthographicHeight !== undefined && input.camera.orthographicHeight > 0;
-    let errorPx: number;
-    let projectedRadiusPx: number;
-    if (ortho) {
-        const scale = fdiv(input.camera.targetHeight, input.camera.orthographicHeight!);
-        errorPx = fmul(fmul(worldError, worldScale), scale);
-        projectedRadiusPx = fmul(worldRadius, scale);
-    } else {
-        errorPx = fdiv(fmul(worldError, pixelScale), surfaceDistance);
-        projectedRadiusPx = fdiv(fmul(worldRadius, pixelScale), surfaceDistance);
-    }
-    return { worldCenter: [wx, wy, wz], worldRadius, errorPx, projectedRadiusPx };
-}
-
-function sphereOutside(planes: readonly MeshLoDFrustumPlane[], center: readonly [number, number, number], radius: number): boolean {
-    for (const [nx, ny, nz, d] of planes) {
-        const signed = fadd(fadd(fmul(nx, center[0]), fmul(ny, center[1])), fadd(fmul(nz, center[2]), d));
-        if (signed < f32(-radius)) {
-            return true;
-        }
-    }
-    return false;
+function project(input: MeshLoDSelectionInput, worldScale: number, pixelScale: number, center: readonly [number, number, number], radius: number, error: number): ProjectedSphere {
+    return projectSphere(
+        input.worldMatrix,
+        input.camera.position,
+        input.camera.near,
+        input.camera.orthographicHeight,
+        input.camera.targetHeight,
+        worldScale,
+        pixelScale,
+        center,
+        radius,
+        error
+    );
 }
 
 function groupResident(input: MeshLoDSelectionInput, group: MeshLoDGroup): boolean {
@@ -139,7 +96,7 @@ function groupResident(input: MeshLoDSelectionInput, group: MeshLoDGroup): boole
 export function selectMeshLoDCpu(input: MeshLoDSelectionInput): MeshLoDSelectionResult {
     const groupCount = input.groups.length;
     const worldScale = maxColumnScale(input.worldMatrix);
-    const pixelScale = fdiv(input.camera.targetHeight, fmul(2, f32(Math.tan(f32(input.camera.verticalFov / 2)))));
+    const pixelScale = perspectivePixelScale(input.camera.targetHeight, input.camera.verticalFov);
     const refineBoundary = fmul(input.screenSpaceError, fadd(1, input.lodHysteresis));
     const coarsenBoundary = fmul(input.screenSpaceError, fsub(1, input.lodHysteresis));
 
@@ -170,7 +127,7 @@ export function selectMeshLoDCpu(input: MeshLoDSelectionInput): MeshLoDSelection
         const nodeIndex = stack.pop()!;
         const node = input.nodes[nodeIndex]!;
         const p = project(input, worldScale, pixelScale, node.center, node.radius, node.error);
-        if (sphereOutside(input.frustumPlanes, p.worldCenter, p.worldRadius)) {
+        if (sphereOutsidePlanes(input.frustumPlanes, p.worldCenter, p.worldRadius)) {
             continue;
         }
         if (node.groupId === -1) {
@@ -200,7 +157,7 @@ export function selectMeshLoDCpu(input: MeshLoDSelectionInput): MeshLoDSelection
             continue; // the finer group is wanted and resident: it will draw instead
         }
         const p = project(input, worldScale, pixelScale, cluster.center, cluster.radius, cluster.error);
-        if (sphereOutside(input.frustumPlanes, p.worldCenter, p.worldRadius)) {
+        if (sphereOutsidePlanes(input.frustumPlanes, p.worldCenter, p.worldRadius)) {
             continue;
         }
         selected.push(c);
