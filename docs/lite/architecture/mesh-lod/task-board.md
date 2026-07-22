@@ -4,7 +4,6 @@
 
 | M | ID | Task | Skill | Notes |
 |---|---|---|---|---|
-|  | T-18 | Execute implementation-plan/04_01_lazy_page_decoder.md | execute-implementation-plan |  |
 |  | T-19 | Execute implementation-plan/04_02_load_pinned_pages.md | execute-implementation-plan |  |
 |  | T-20 | Execute implementation-plan/04_03_scene_registry_cpu_selection.md | execute-implementation-plan |  |
 |  | T-21 | Execute implementation-plan/04_04_pbr_coarse_indirect_rendering.md | execute-implementation-plan |  |
@@ -47,6 +46,7 @@
 |  | T-15 | Execute implementation-plan/03_02_parse_mlod_buffers.md | execute-implementation-plan | done 2026-07-22 - d0816a75; full LE parser/validator mirroring C++ validateContainer, CRC32C, record interfaces; 25 tests incl. 3 real statue assets vs statue-stats.json + 20-case mutation matrix; lint green |
 |  | T-16 | Execute implementation-plan/03_03_range_source_bootstrap.md | execute-implementation-plan | done 2026-07-22 - 62b29c8f; range source (URL/ArrayBuffer/Blob) + strict HTTP protocol validation, coarse-first two-request bootstrap, available-aware parse; loadMeshLoD real; +lite-integration vitest project; 71 mesh-lod tests green; lint green |
 |  | T-17 | Execute implementation-plan/03_04_cpu_selection_oracle.md | execute-implementation-plan | done 2026-07-22 - 55e78b91; float32 CPU oracle (traversal, culling, hysteresis, crack-free DAG cut + residency fallback, page demand); ./mesh-lod/testing subpath; committed selection fixtures; 79 mesh-lod tests green; lint green. Phase 3 complete. |
+|  | T-18 | Execute implementation-plan/04_01_lazy_page_decoder.md | execute-implementation-plan | done 2026-07-22 - 04441b02; export shared MeshoptDecoderModule (type-only), mesh-lod-page-decoder with validate-before-codec + ATTRIBUTES/TRIANGLES NONE decode + index-bounds; 6 mock-decoder tests; existing decode-error unchanged; lint green |
 
 ## Untriaged
 
