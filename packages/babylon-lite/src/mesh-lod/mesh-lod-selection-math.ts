@@ -90,3 +90,21 @@ export function sphereOutsidePlanes(planes: readonly MeshLoDFrustumPlane[], cent
     }
     return false;
 }
+
+/** Extract the six normalized frustum planes `[nx, ny, nz, d]` (inside = `n·p+d>=0`)
+ *  from a column-major view-projection matrix. Left, right, bottom, top, near, far —
+ *  the same order and normalization the selection WGSL uses. */
+export function extractFrustumPlanes(m: ArrayLike<number>): MeshLoDFrustumPlane[] {
+    const plane = (x: number, y: number, z: number, w: number): MeshLoDFrustumPlane => {
+        const invLen = 1 / Math.hypot(x, y, z);
+        return [x * invLen, y * invLen, z * invLen, w * invLen];
+    };
+    return [
+        plane(m[3]! + m[0]!, m[7]! + m[4]!, m[11]! + m[8]!, m[15]! + m[12]!),
+        plane(m[3]! - m[0]!, m[7]! - m[4]!, m[11]! - m[8]!, m[15]! - m[12]!),
+        plane(m[3]! + m[1]!, m[7]! + m[5]!, m[11]! + m[9]!, m[15]! + m[13]!),
+        plane(m[3]! - m[1]!, m[7]! - m[5]!, m[11]! - m[9]!, m[15]! - m[13]!),
+        plane(m[2]!, m[6]!, m[10]!, m[14]!),
+        plane(m[3]! - m[2]!, m[7]! - m[6]!, m[11]! - m[10]!, m[15]! - m[14]!),
+    ];
+}

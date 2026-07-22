@@ -18,9 +18,13 @@
 import { BU } from "../engine/gpu-flags.js";
 import type { EngineContext } from "../engine/engine.js";
 import { retireGpuResources } from "../engine/gpu-resource-retirement.js";
+import type { DrawUpdateBatch } from "../render/renderable.js";
+import type { RenderTargetSignature } from "../engine/render-target.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
-import { maxColumnScale } from "./mesh-lod-selection-math.js";
+import type { MeshLoDFrustumPlane } from "./mesh-lod-selection-math.js";
+import { extractFrustumPlanes, maxColumnScale, perspectivePixelScale, projectSphere, sphereOutsidePlanes } from "./mesh-lod-selection-math.js";
 import type { MeshLoDAssetRuntime, MeshLoDCluster, MeshLoDGroup, MeshLoDHierarchyNode, MeshLoDPageRecord, MeshLoDPageRuntime } from "./mesh-lod-runtime.js";
+import selectionWgsl from "./mesh-lod-selection.wgsl?raw";
 
 // ─── Record word/byte layouts (architecture §12.1) ───────────────────
 
@@ -50,6 +54,12 @@ const U32_SCRATCH = new Uint32Array(F32_SCRATCH.buffer);
 function f32Bits(value: number): number {
     F32_SCRATCH[0] = value;
     return U32_SCRATCH[0]!;
+}
+
+/** Reinterpret a u32 bit pattern back to float32 (mirrors the WGSL `bitcast<f32>`). */
+function u32ToF32(bits: number): number {
+    U32_SCRATCH[0] = bits;
+    return F32_SCRATCH[0]!;
 }
 
 // ─── Immutable metadata packing ──────────────────────────────────────
@@ -201,6 +211,302 @@ export function packInstanceRecord(f32: Float32Array, u32: Uint32Array, wordBase
     u32[wordBase + 31] = 0; // bytes 124–127: zero
 }
 
+// ─── Deterministic GPU selection model (WGSL mirror for Node equivalence) ──
+
+/** Camera + selection parameters for the GPU model, matching the params UBO the
+ *  WGSL compute reads. */
+export interface MeshLoDGpuSelectionParams {
+    readonly cameraPos: readonly [number, number, number];
+    readonly verticalFov: number;
+    readonly near: number;
+    readonly targetWidth: number;
+    readonly targetHeight: number;
+    readonly orthographicHeight?: number;
+    readonly frustumPlanes: readonly MeshLoDFrustumPlane[];
+    readonly screenSpaceError: number;
+    readonly lodHysteresis: number;
+    readonly levelCount: number;
+}
+
+/** Packed inputs to the GPU selection model — exactly the buffers uploaded to the
+ *  GPU. Reading them here validates the byte packing along the selection path. */
+export interface MeshLoDGpuSelectionModelInput {
+    readonly nodes: Uint32Array;
+    readonly groups: Uint32Array;
+    readonly clusters: Uint32Array;
+    readonly groupPageRefs: Uint32Array;
+    readonly pageState: Uint32Array;
+    readonly pageStoredBytes: ArrayLike<number>;
+    /** Packed 128-byte instance records (`Float32Array`, `INSTANCE_WORDS` per slot). */
+    readonly instances: Float32Array;
+    /** Same buffer as `instances`, `u32` view (visibility/id words). */
+    readonly instancesU32: Uint32Array;
+    /** Prior per-instance/group `wasFineRequired` bitset; updated in place. */
+    readonly priorState: Uint32Array;
+    readonly instanceCount: number;
+    readonly nodeCount: number;
+    readonly groupCount: number;
+    readonly clusterCount: number;
+    readonly pageCount: number;
+    readonly wordsPerInstance: number;
+    readonly params: MeshLoDGpuSelectionParams;
+    /** Optional selected-list capacity; exceeding it sets `overflow` without OOB writes. */
+    readonly maxSelected?: number;
+}
+
+/** One selected (cluster, instance) pair in deterministic append order. */
+export interface MeshLoDGpuSelectedPair {
+    readonly clusterId: number;
+    readonly instanceId: number;
+}
+
+export interface MeshLoDGpuSelectionModelResult {
+    readonly selected: MeshLoDGpuSelectedPair[];
+    readonly desiredPages: { readonly pageId: number; readonly priority: number }[];
+    readonly visibleGroupCount: number;
+    readonly fallbackGroupCount: number;
+    readonly renderedTriangleCount: number;
+    readonly selectedMeshletCount: number;
+    readonly maximumSelectedErrorPixels: number;
+    readonly maximumUnmetErrorPixels: number;
+    readonly overflow: boolean;
+}
+
+function priorBit(prior: Uint32Array, slot: number, wordsPerInstance: number, group: number): boolean {
+    return (prior[slot * wordsPerInstance + (group >>> 5)]! & (1 << (group & 31))) !== 0;
+}
+
+function setPriorBit(prior: Uint32Array, slot: number, wordsPerInstance: number, group: number, value: boolean): void {
+    const idx = slot * wordsPerInstance + (group >>> 5);
+    const mask = 1 << (group & 31);
+    prior[idx] = value ? prior[idx]! | mask : prior[idx]! & ~mask;
+}
+
+function nodeCenter(nodes: Uint32Array, base: number): [number, number, number] {
+    return [u32ToF32(nodes[base]!), u32ToF32(nodes[base + 1]!), u32ToF32(nodes[base + 2]!)];
+}
+
+function pageResident(pageState: Uint32Array, pageId: number): boolean {
+    return (pageState[pageId * PAGE_STATE_WORDS]! & PAGE_FLAG_RESIDENT) !== 0;
+}
+
+function groupPagesResident(input: MeshLoDGpuSelectionModelInput, firstPageRef: number, pageRefCount: number): boolean {
+    for (let i = 0; i < pageRefCount; i++) {
+        if (!pageResident(input.pageState, input.groupPageRefs[firstPageRef + i]!)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Run the deterministic GPU selection model over the packed buffers. It reproduces
+ *  the selection WGSL exactly (shared float32 math, per-instance dispatch, per-leaf
+ *  frustum visibility, crack-free residency cut, atomic-append ordering, and the
+ *  benefit/cost page demand) so Node fixtures can compare GPU selection to the CPU
+ *  oracle without a real device. Returns selected (cluster, instance) pairs in
+ *  append order (ascending instance, then ascending cluster). */
+export function runMeshLoDGpuSelection(input: MeshLoDGpuSelectionModelInput): MeshLoDGpuSelectionModelResult {
+    const { params, groupCount, clusterCount, nodeCount, wordsPerInstance } = input;
+    const pixelScale = perspectivePixelScale(params.targetHeight, params.verticalFov);
+    const refineBoundary = Math.fround(params.screenSpaceError * Math.fround(1 + params.lodHysteresis));
+    const coarsenBoundary = Math.fround(params.screenSpaceError * Math.fround(1 - params.lodHysteresis));
+    const maxSelected = input.maxSelected ?? Number.POSITIVE_INFINITY;
+
+    const selected: MeshLoDGpuSelectedPair[] = [];
+    const demandShare = new Map<number, number>();
+    let visibleGroupCount = 0;
+    let fallbackGroupCount = 0;
+    let renderedTriangleCount = 0;
+    let selectedMeshletCount = 0;
+    let maximumSelectedErrorPixels = 0;
+    let maximumUnmetErrorPixels = 0;
+    let overflow = false;
+
+    const world = new Float32Array(16);
+    const groupErrorPx = new Float64Array(groupCount);
+    const fineRequired = new Uint8Array(groupCount);
+    const resident = new Uint8Array(groupCount);
+    const visible = new Uint8Array(groupCount);
+
+    for (let s = 0; s < input.instanceCount; s++) {
+        const iBase = s * INSTANCE_WORDS;
+        if (input.instancesU32[iBase + 29] === 0) {
+            continue; // invisible instance contributes nothing
+        }
+        for (let i = 0; i < 16; i++) {
+            world[i] = input.instances[iBase + i]!;
+        }
+        const worldScale = input.instances[iBase + 28]!; // precomputed max column scale
+
+        // Group evaluation + prior-state hysteresis update.
+        for (let g = 0; g < groupCount; g++) {
+            const gBase = g * GROUP_WORDS;
+            resident[g] = groupPagesResident(input, input.groups[gBase + 8]!, input.groups[gBase + 9]!) ? 1 : 0;
+            const simplifiedError = u32ToF32(input.groups[gBase + 4]!);
+            const terminal = (input.groups[gBase + 10]! & 0x1) !== 0;
+            if (terminal || !Number.isFinite(simplifiedError)) {
+                fineRequired[g] = 1;
+                groupErrorPx[g] = Number.POSITIVE_INFINITY;
+                setPriorBit(input.priorState, s, wordsPerInstance, g, true);
+                continue;
+            }
+            const center: [number, number, number] = [u32ToF32(input.groups[gBase]!), u32ToF32(input.groups[gBase + 1]!), u32ToF32(input.groups[gBase + 2]!)];
+            const radius = u32ToF32(input.groups[gBase + 3]!);
+            const errorPx = projectSphere(
+                world,
+                params.cameraPos,
+                params.near,
+                params.orthographicHeight,
+                params.targetHeight,
+                worldScale,
+                pixelScale,
+                center,
+                radius,
+                simplifiedError
+            ).errorPx;
+            groupErrorPx[g] = errorPx;
+            const wasFine = priorBit(input.priorState, s, wordsPerInstance, g);
+            const fine = wasFine ? errorPx >= coarsenBoundary : errorPx > refineBoundary;
+            fineRequired[g] = fine ? 1 : 0;
+            setPriorBit(input.priorState, s, wordsPerInstance, g, fine);
+        }
+
+        // Per-leaf-node frustum visibility (equivalent to root-down traversal under
+        // conservative bounds: a not-outside leaf's ancestors are all not-outside).
+        visible.fill(0);
+        for (let n = 0; n < nodeCount; n++) {
+            const nBase = n * NODE_WORDS;
+            const gid = input.nodes[nBase + 5]! | 0;
+            if (gid === -1) {
+                continue;
+            }
+            const p = projectSphere(
+                world,
+                params.cameraPos,
+                params.near,
+                params.orthographicHeight,
+                params.targetHeight,
+                worldScale,
+                pixelScale,
+                nodeCenter(input.nodes, nBase),
+                u32ToF32(input.nodes[nBase + 3]!),
+                u32ToF32(input.nodes[nBase + 4]!)
+            );
+            if (!sphereOutsidePlanes(params.frustumPlanes, p.worldCenter, p.worldRadius)) {
+                visible[gid] = 1;
+            }
+        }
+        for (let g = 0; g < groupCount; g++) {
+            visibleGroupCount += visible[g]!;
+        }
+
+        // Crack-free group-DAG cut + cluster-level culling, ascending cluster id.
+        const demandedGroups = new Set<number>();
+        for (let c = 0; c < clusterCount; c++) {
+            const cBase = c * CLUSTER_WORDS;
+            const g = input.clusters[cBase + 5]!;
+            if (!visible[g] || !resident[g] || !fineRequired[g]) {
+                continue;
+            }
+            const r = input.clusters[cBase + 6]! | 0;
+            if (r !== -1 && fineRequired[r] === 1 && resident[r] === 1) {
+                continue; // finer group wanted and resident: it will draw instead
+            }
+            const center: [number, number, number] = [u32ToF32(input.clusters[cBase]!), u32ToF32(input.clusters[cBase + 1]!), u32ToF32(input.clusters[cBase + 2]!)];
+            const p = projectSphere(
+                world,
+                params.cameraPos,
+                params.near,
+                params.orthographicHeight,
+                params.targetHeight,
+                worldScale,
+                pixelScale,
+                center,
+                u32ToF32(input.clusters[cBase + 3]!),
+                u32ToF32(input.clusters[cBase + 4]!)
+            );
+            if (sphereOutsidePlanes(params.frustumPlanes, p.worldCenter, p.worldRadius)) {
+                continue;
+            }
+            if (selected.length >= maxSelected) {
+                overflow = true;
+                break;
+            }
+            selected.push({ clusterId: c, instanceId: s });
+            selectedMeshletCount++;
+            renderedTriangleCount += input.clusters[cBase + 11]!;
+            const err = groupErrorPx[g]!;
+            if (Number.isFinite(err) && err > maximumSelectedErrorPixels) {
+                maximumSelectedErrorPixels = err;
+            }
+            if (r !== -1 && fineRequired[r] === 1 && resident[r] === 0) {
+                demandedGroups.add(r);
+            }
+        }
+
+        // Page demand priority (architecture §11.1), per demanded finer group.
+        for (const r of demandedGroups) {
+            const gBase = r * GROUP_WORDS;
+            const firstPageRef = input.groups[gBase + 8]!;
+            const pageRefCount = input.groups[gBase + 9]!;
+            const missing: number[] = [];
+            for (let i = 0; i < pageRefCount; i++) {
+                const pageId = input.groupPageRefs[firstPageRef + i]!;
+                if (!pageResident(input.pageState, pageId)) {
+                    missing.push(pageId);
+                }
+            }
+            if (missing.length === 0) {
+                continue;
+            }
+            fallbackGroupCount++;
+            const center: [number, number, number] = [u32ToF32(input.groups[gBase]!), u32ToF32(input.groups[gBase + 1]!), u32ToF32(input.groups[gBase + 2]!)];
+            const p = projectSphere(
+                world,
+                params.cameraPos,
+                params.near,
+                params.orthographicHeight,
+                params.targetHeight,
+                worldScale,
+                pixelScale,
+                center,
+                u32ToF32(input.groups[gBase + 3]!),
+                u32ToF32(input.groups[gBase + 4]!)
+            );
+            if (p.errorPx > maximumUnmetErrorPixels) {
+                maximumUnmetErrorPixels = p.errorPx;
+            }
+            const areaCap = params.targetWidth * params.targetHeight;
+            const projectedAreaPx = Math.min(Math.PI * p.projectedRadiusPx * p.projectedRadiusPx, areaCap);
+            const qualityPressure = Math.max(0, p.errorPx / params.screenSpaceError - 1);
+            const groupBenefit = projectedAreaPx * qualityPressure;
+            const pageShare = groupBenefit / missing.length;
+            for (const pageId of missing) {
+                demandShare.set(pageId, (demandShare.get(pageId) ?? 0) + pageShare);
+            }
+        }
+    }
+
+    const desiredPages: { pageId: number; priority: number }[] = [];
+    for (const [pageId, share] of demandShare) {
+        const stored = input.pageStoredBytes[pageId] ?? 1;
+        desiredPages.push({ pageId, priority: share / stored });
+    }
+    desiredPages.sort((a, b) => (b.priority !== a.priority ? b.priority - a.priority : a.pageId - b.pageId));
+
+    return {
+        selected,
+        desiredPages,
+        visibleGroupCount,
+        fallbackGroupCount,
+        renderedTriangleCount,
+        selectedMeshletCount,
+        maximumSelectedErrorPixels,
+        maximumUnmetErrorPixels,
+        overflow,
+    };
+}
+
 // ─── Device-limit-checked storage buffers ────────────────────────────
 
 function checkedStorageBuffer(engine: EngineContext, byteLength: number, label: string, extraUsage = 0): GPUBuffer {
@@ -232,17 +538,22 @@ function residencySignature(runtime: MeshLoDAssetRuntime): number {
 
 // ─── Per-asset persistent buffers ────────────────────────────────────
 
-/** Immutable per-asset hierarchy buffers plus the mutable page-state buffer. Shared
- *  by every scene batch and instance referencing the same asset. */
+/** Immutable per-asset metadata buffer plus the mutable page-state buffer. Shared by
+ *  every scene batch and instance referencing the same asset. The four immutable
+ *  tables are concatenated into one `metaBuffer` (nodes ++ groups ++ clusters ++
+ *  group-page-refs) so the selection compute stays within the 8-storage-buffer limit;
+ *  their word offsets are published for the params UBO and bind-group indexing. */
 export interface MeshLoDGpuAssetBuffers {
     readonly device: GPUDevice;
-    readonly nodeBuffer: GPUBuffer;
-    readonly groupBuffer: GPUBuffer;
-    readonly clusterBuffer: GPUBuffer;
-    readonly pageRefBuffer: GPUBuffer;
+    readonly metaBuffer: GPUBuffer;
     readonly pageStateBuffer: GPUBuffer;
     /** CPU mirror of the page-state words, re-derived and re-uploaded on residency change. */
     readonly pageStateData: Uint32Array;
+    /** `u32` word offsets into `metaBuffer` for each concatenated table. */
+    readonly nodeWordOffset: number;
+    readonly groupWordOffset: number;
+    readonly clusterWordOffset: number;
+    readonly pageRefWordOffset: number;
     readonly nodeCount: number;
     readonly groupCount: number;
     readonly clusterCount: number;
@@ -270,33 +581,38 @@ export function getMeshLoDGpuAssetBuffers(engine: EngineContext, runtime: MeshLo
     const refs = packGroupPageRefs(runtime.groupPageRefs);
     const pageState = buildPageStateData(runtime.gpu.pages, runtime.pageRecords, runtime.generation);
 
-    const nodeBuffer = checkedStorageBuffer(engine, nodes.byteLength, "mesh-lod-nodes");
-    const groupBuffer = checkedStorageBuffer(engine, groups.byteLength, "mesh-lod-groups");
-    const clusterBuffer = checkedStorageBuffer(engine, clusters.byteLength, "mesh-lod-clusters");
-    const pageRefBuffer = checkedStorageBuffer(engine, refs.byteLength, "mesh-lod-page-refs");
+    const nodeWordOffset = 0;
+    const groupWordOffset = nodeWordOffset + nodes.length;
+    const clusterWordOffset = groupWordOffset + groups.length;
+    const pageRefWordOffset = clusterWordOffset + clusters.length;
+    const meta = new Uint32Array(pageRefWordOffset + refs.length);
+    meta.set(nodes, nodeWordOffset);
+    meta.set(groups, groupWordOffset);
+    meta.set(clusters, clusterWordOffset);
+    meta.set(refs, pageRefWordOffset);
+
+    const metaBuffer = checkedStorageBuffer(engine, meta.byteLength, "mesh-lod-meta");
     const pageStateBuffer = checkedStorageBuffer(engine, pageState.byteLength, "mesh-lod-page-state");
 
     const q = engine._device.queue;
-    q.writeBuffer(nodeBuffer, 0, nodes.buffer, nodes.byteOffset, nodes.byteLength);
-    q.writeBuffer(groupBuffer, 0, groups.buffer, groups.byteOffset, groups.byteLength);
-    q.writeBuffer(clusterBuffer, 0, clusters.buffer, clusters.byteOffset, clusters.byteLength);
-    q.writeBuffer(pageRefBuffer, 0, refs.buffer, refs.byteOffset, refs.byteLength);
+    q.writeBuffer(metaBuffer, 0, meta.buffer, meta.byteOffset, meta.byteLength);
     q.writeBuffer(pageStateBuffer, 0, pageState.buffer, pageState.byteOffset, pageState.byteLength);
 
     const buffers: MeshLoDGpuAssetBuffers = {
         device: engine._device,
-        nodeBuffer,
-        groupBuffer,
-        clusterBuffer,
-        pageRefBuffer,
+        metaBuffer,
         pageStateBuffer,
         pageStateData: pageState,
+        nodeWordOffset,
+        groupWordOffset,
+        clusterWordOffset,
+        pageRefWordOffset,
         nodeCount: runtime.hierarchyNodes.length,
         groupCount: runtime.groups.length,
         clusterCount: runtime.clusters.length,
         pageCount: runtime.gpu.pages.length,
         residencyEpoch: residencySignature(runtime),
-        byteLength: nodes.byteLength + groups.byteLength + clusters.byteLength + refs.byteLength + pageState.byteLength,
+        byteLength: meta.byteLength + pageState.byteLength,
     };
     runtime.gpuSelection = buffers;
     return buffers;
@@ -319,10 +635,7 @@ export function syncMeshLoDPageState(engine: EngineContext, buffers: MeshLoDGpuA
 
 /** Destroy all buffers owned by a per-asset record. Idempotent-safe. */
 export function disposeMeshLoDGpuAssetBuffers(buffers: MeshLoDGpuAssetBuffers): void {
-    buffers.nodeBuffer.destroy();
-    buffers.groupBuffer.destroy();
-    buffers.clusterBuffer.destroy();
-    buffers.pageRefBuffer.destroy();
+    buffers.metaBuffer.destroy();
     buffers.pageStateBuffer.destroy();
 }
 
@@ -472,4 +785,440 @@ export function disposeMeshLoDGpuInstanceState(state: MeshLoDGpuInstanceState): 
     state.priorStateBuffer = null;
     state.capacity = 0;
     state.instanceCount = 0;
+}
+
+// ─── Compute orchestration: pipelines, params, transient buffers, batch ──
+
+/** Params UBO byte size (13 × vec4, architecture §12; allocated at 256 for margin). */
+const PARAMS_BYTES = 208;
+const PARAMS_ALLOC = 256;
+/** control[0..2] = indirect (count, 1, 1); control[3] = draw-vertex count (Task 5.3). */
+const CONTROL_DIAG_OFFSET = 4;
+/** diag words: visibleGroupCount, renderedTriangleCount, overflow, fallbackGroupCount. */
+const CONTROL_DIAG_WORDS = 4;
+const CONTROL_PAGE_DEMAND_OFFSET = CONTROL_DIAG_OFFSET + CONTROL_DIAG_WORDS;
+const SELECTION_WORKGROUP = 64;
+
+/** Diagnostics word indices within the control buffer (relative to its base). */
+export const CONTROL_COUNT_WORD = 0;
+export const CONTROL_DRAW_VERTEX_WORD = 3;
+export const CONTROL_VISIBLE_GROUP_WORD = CONTROL_DIAG_OFFSET;
+export const CONTROL_TRIANGLE_WORD = CONTROL_DIAG_OFFSET + 1;
+export const CONTROL_OVERFLOW_WORD = CONTROL_DIAG_OFFSET + 2;
+export const CONTROL_FALLBACK_WORD = CONTROL_DIAG_OFFSET + 3;
+
+interface MeshLoDSelectionPipelines {
+    readonly device: GPUDevice;
+    readonly layout: GPUBindGroupLayout;
+    readonly pipelineLayout: GPUPipelineLayout;
+    readonly traverse: GPUComputePipeline;
+    readonly evaluate: GPUComputePipeline;
+    readonly select: GPUComputePipeline;
+    readonly demand: GPUComputePipeline;
+    readonly module: GPUShaderModule;
+}
+
+let _pipelines: MeshLoDSelectionPipelines | null = null;
+
+/** Build (once per device) the four selection compute pipelines over one explicit
+ *  bind-group layout shared by every entry point. */
+export function getMeshLoDSelectionPipelines(engine: EngineContext): MeshLoDSelectionPipelines {
+    if (_pipelines && _pipelines.device === engine._device) {
+        return _pipelines;
+    }
+    const device = engine._device;
+    const C = 0x4; // GPUShaderStage.COMPUTE
+    const buf = (binding: number, type: GPUBufferBindingType): GPUBindGroupLayoutEntry => ({ binding, visibility: C, buffer: { type } });
+    const layout = device.createBindGroupLayout({
+        label: "mesh-lod-selection",
+        entries: [
+            buf(0, "uniform"),
+            buf(1, "read-only-storage"),
+            buf(2, "read-only-storage"),
+            buf(3, "read-only-storage"),
+            buf(4, "storage"),
+            buf(5, "storage"),
+            buf(6, "storage"),
+            buf(7, "storage"),
+        ],
+    });
+    const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+    const module = device.createShaderModule({ label: "mesh-lod-selection", code: selectionWgsl });
+    const pipe = (entryPoint: string): GPUComputePipeline =>
+        device.createComputePipeline({ label: `mesh-lod-${entryPoint}`, layout: pipelineLayout, compute: { module, entryPoint } });
+    _pipelines = {
+        device,
+        layout,
+        pipelineLayout,
+        module,
+        traverse: pipe("traverse"),
+        evaluate: pipe("evaluateGroups"),
+        select: pipe("selectClusters"),
+        demand: pipe("computeDemand"),
+    };
+    return _pipelines;
+}
+
+/** Per-batch transient GPU selection state: group-state/selected/control buffers,
+ *  the params UBO, and the cached bind group. Grows make-before-break with the
+ *  batch's instance capacity. */
+export interface MeshLoDGpuBatchState {
+    device: GPUDevice | null;
+    groupStateBuffer: GPUBuffer | null;
+    selectedBuffer: GPUBuffer | null;
+    controlBuffer: GPUBuffer | null;
+    paramsBuffer: GPUBuffer | null;
+    bindGroup: GPUBindGroup | null;
+    instanceCapacity: number;
+    selectedCapacity: number;
+    controlWords: number;
+    groupCount: number;
+    clusterCount: number;
+    nodeCount: number;
+    pageCount: number;
+    paramsBytes: ArrayBuffer;
+    paramsF32: Float32Array;
+    paramsU32: Uint32Array;
+    boundMeta: GPUBuffer | null;
+    boundPageState: GPUBuffer | null;
+    boundInstances: GPUBuffer | null;
+    boundPrior: GPUBuffer | null;
+}
+
+/** Create empty per-batch transient selection state. */
+export function createMeshLoDGpuBatchState(): MeshLoDGpuBatchState {
+    const paramsBytes = new ArrayBuffer(PARAMS_ALLOC);
+    return {
+        device: null,
+        groupStateBuffer: null,
+        selectedBuffer: null,
+        controlBuffer: null,
+        paramsBuffer: null,
+        bindGroup: null,
+        instanceCapacity: 0,
+        selectedCapacity: 0,
+        controlWords: 0,
+        groupCount: 0,
+        clusterCount: 0,
+        nodeCount: 0,
+        pageCount: 0,
+        paramsBytes,
+        paramsF32: new Float32Array(paramsBytes),
+        paramsU32: new Uint32Array(paramsBytes),
+        boundMeta: null,
+        boundPageState: null,
+        boundInstances: null,
+        boundPrior: null,
+    };
+}
+
+/** Size the transient buffers for `instanceCapacity` instances of the asset. The
+ *  group-state and selected-list scale with instance capacity; growth retires the old
+ *  buffers after the next frame drains and invalidates the bind group. */
+function ensureMeshLoDBatchBuffers(engine: EngineContext, state: MeshLoDGpuBatchState, instanceCapacity: number, assetBuffers: MeshLoDGpuAssetBuffers): void {
+    const device = engine._device;
+    if (state.device !== device) {
+        state.groupStateBuffer = state.selectedBuffer = state.controlBuffer = state.paramsBuffer = null;
+        state.bindGroup = null;
+        state.instanceCapacity = 0;
+        state.device = device;
+    }
+    state.groupCount = assetBuffers.groupCount;
+    state.clusterCount = assetBuffers.clusterCount;
+    state.nodeCount = assetBuffers.nodeCount;
+    state.pageCount = assetBuffers.pageCount;
+    const controlWords = CONTROL_PAGE_DEMAND_OFFSET + Math.max(assetBuffers.pageCount, 1);
+    if (!state.controlBuffer) {
+        state.controlBuffer = device.createBuffer({ label: "mesh-lod-control", size: controlWords * 4, usage: BU.STORAGE | BU.INDIRECT | BU.COPY_DST | BU.COPY_SRC });
+        state.controlWords = controlWords;
+        // Fixed indirect Y/Z = 1 (count in word 0 is filled by the atomic each frame).
+        device.queue.writeBuffer(state.controlBuffer, 4, Uint32Array.from([1, 1]).buffer);
+        state.bindGroup = null;
+    }
+    if (!state.paramsBuffer) {
+        state.paramsBuffer = device.createBuffer({ label: "mesh-lod-params", size: PARAMS_ALLOC, usage: BU.UNIFORM | BU.COPY_DST });
+        state.bindGroup = null;
+    }
+    if (instanceCapacity <= state.instanceCapacity && state.groupStateBuffer && state.selectedBuffer) {
+        return;
+    }
+    let capacity = Math.max(state.instanceCapacity, 1);
+    while (capacity < instanceCapacity) {
+        capacity *= 2;
+    }
+    const oldGroupState = state.groupStateBuffer;
+    const oldSelected = state.selectedBuffer;
+    const selectedCapacity = Math.max(assetBuffers.clusterCount * capacity, 1);
+    state.groupStateBuffer = device.createBuffer({ label: "mesh-lod-group-state", size: Math.max(capacity * assetBuffers.groupCount, 1) * 4, usage: BU.STORAGE | BU.COPY_DST });
+    state.selectedBuffer = device.createBuffer({ label: "mesh-lod-selected", size: selectedCapacity * 2 * 4, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC });
+    state.instanceCapacity = capacity;
+    state.selectedCapacity = selectedCapacity;
+    state.bindGroup = null;
+    if (oldGroupState || oldSelected) {
+        retireGpuResources(engine, () => {
+            oldGroupState?.destroy();
+            oldSelected?.destroy();
+        });
+    }
+}
+
+function ensureMeshLoDBindGroup(
+    engine: EngineContext,
+    state: MeshLoDGpuBatchState,
+    pipelines: MeshLoDSelectionPipelines,
+    assetBuffers: MeshLoDGpuAssetBuffers,
+    instanceState: MeshLoDGpuInstanceState
+): void {
+    const instances = instanceState.instanceBuffer!;
+    const prior = instanceState.priorStateBuffer!;
+    if (
+        state.bindGroup &&
+        state.boundMeta === assetBuffers.metaBuffer &&
+        state.boundPageState === assetBuffers.pageStateBuffer &&
+        state.boundInstances === instances &&
+        state.boundPrior === prior
+    ) {
+        return;
+    }
+    state.bindGroup = engine._device.createBindGroup({
+        label: "mesh-lod-selection",
+        layout: pipelines.layout,
+        entries: [
+            { binding: 0, resource: { buffer: state.paramsBuffer! } },
+            { binding: 1, resource: { buffer: assetBuffers.metaBuffer } },
+            { binding: 2, resource: { buffer: assetBuffers.pageStateBuffer } },
+            { binding: 3, resource: { buffer: instances } },
+            { binding: 4, resource: { buffer: prior } },
+            { binding: 5, resource: { buffer: state.groupStateBuffer! } },
+            { binding: 6, resource: { buffer: state.selectedBuffer! } },
+            { binding: 7, resource: { buffer: state.controlBuffer! } },
+        ],
+    });
+    state.boundMeta = assetBuffers.metaBuffer;
+    state.boundPageState = assetBuffers.pageStateBuffer;
+    state.boundInstances = instances;
+    state.boundPrior = prior;
+}
+
+/** Destroy the per-batch transient selection buffers. Idempotent-safe. */
+export function disposeMeshLoDGpuBatchState(state: MeshLoDGpuBatchState): void {
+    state.groupStateBuffer?.destroy();
+    state.selectedBuffer?.destroy();
+    state.controlBuffer?.destroy();
+    state.paramsBuffer?.destroy();
+    state.groupStateBuffer = state.selectedBuffer = state.controlBuffer = state.paramsBuffer = null;
+    state.bindGroup = null;
+    state.instanceCapacity = 0;
+}
+
+/** Camera + selection inputs for one frame's GPU selection, produced by the scene from
+ *  the active pass camera. */
+export interface MeshLoDGpuFrameParams {
+    readonly cameraPos: readonly [number, number, number];
+    readonly verticalFov: number;
+    readonly near: number;
+    readonly targetWidth: number;
+    readonly targetHeight: number;
+    readonly orthographicHeight?: number;
+    /** Column-major view-projection for frustum-plane extraction. */
+    readonly viewProjection: ArrayLike<number>;
+    /** Enable frustum culling (GPU render path); `false` disables it (planeCount = 0). */
+    readonly frustumCull: boolean;
+    readonly screenSpaceError: number;
+    readonly lodHysteresis: number;
+    readonly levelCount: number;
+}
+
+function writeSelectionParams(
+    state: MeshLoDGpuBatchState,
+    assetBuffers: MeshLoDGpuAssetBuffers,
+    instanceCount: number,
+    wordsPerInstance: number,
+    frame: MeshLoDGpuFrameParams
+): void {
+    const f = state.paramsF32;
+    const u = state.paramsU32;
+    const planes = frame.frustumCull ? extractFrustumPlanes(frame.viewProjection) : [];
+    for (let i = 0; i < 6; i++) {
+        const p = planes[i] ?? [0, 0, 0, 1];
+        f[i * 4] = p[0];
+        f[i * 4 + 1] = p[1];
+        f[i * 4 + 2] = p[2];
+        f[i * 4 + 3] = p[3];
+    }
+    f[24] = frame.cameraPos[0];
+    f[25] = frame.cameraPos[1];
+    f[26] = frame.cameraPos[2];
+    f[27] = frame.near;
+    f[28] = frame.targetWidth;
+    f[29] = frame.targetHeight;
+    f[30] = perspectivePixelScale(frame.targetHeight, frame.verticalFov);
+    f[31] = frame.orthographicHeight ?? 0;
+    f[32] = frame.screenSpaceError;
+    f[33] = Math.fround(frame.screenSpaceError * Math.fround(1 + frame.lodHysteresis));
+    f[34] = Math.fround(frame.screenSpaceError * Math.fround(1 - frame.lodHysteresis));
+    f[35] = planes.length;
+    u[36] = instanceCount;
+    u[37] = assetBuffers.groupCount;
+    u[38] = assetBuffers.clusterCount;
+    u[39] = assetBuffers.nodeCount;
+    u[40] = wordsPerInstance;
+    u[41] = state.selectedCapacity;
+    u[42] = assetBuffers.pageCount;
+    u[43] = frame.levelCount;
+    u[44] = assetBuffers.nodeWordOffset;
+    u[45] = assetBuffers.groupWordOffset;
+    u[46] = assetBuffers.clusterWordOffset;
+    u[47] = assetBuffers.pageRefWordOffset;
+    u[48] = CONTROL_DIAG_OFFSET;
+    u[49] = CONTROL_PAGE_DEMAND_OFFSET;
+    u[50] = 0;
+    u[51] = 0;
+}
+
+/** One selection step to replay in the shared compute pass. */
+interface MeshLoDComputeStep {
+    readonly pipeline: GPUComputePipeline;
+    readonly bindGroup: GPUBindGroup;
+    readonly workgroups?: number;
+    readonly indirectBuffer?: GPUBuffer;
+    readonly indirectOffset?: number;
+}
+
+interface MeshLoDBufferClear {
+    readonly buffer: GPUBuffer;
+    readonly offset: number;
+    readonly size: number;
+}
+
+interface MeshLoDSelectionJob {
+    readonly clears: MeshLoDBufferClear[];
+    readonly steps: MeshLoDComputeStep[];
+}
+
+/** @internal Feature-owned update batch: collects every MeshLoD batch's selection
+ *  (and, from Task 5.3, expansion) work and submits it as one compute pass flushed
+ *  before the render pass (architecture §12.3). One per render-target signature. */
+export interface MeshLoDUpdateBatch extends DrawUpdateBatch {
+    queue(job: MeshLoDSelectionJob): void;
+}
+
+let _updateBatches: WeakMap<RenderTargetSignature, MeshLoDUpdateBatch> | null = null;
+
+/** Return the task-local MeshLoD update batch for one render-target signature. */
+export function getMeshLoDUpdateBatch(signature: RenderTargetSignature): MeshLoDUpdateBatch {
+    _updateBatches ??= new WeakMap();
+    const existing = _updateBatches.get(signature);
+    if (existing) {
+        return existing;
+    }
+    const jobs: MeshLoDSelectionJob[] = [];
+    let count = 0;
+    const batch: MeshLoDUpdateBatch = {
+        reset(): void {
+            count = 0;
+        },
+        flush(engine): void {
+            if (count === 0) {
+                return;
+            }
+            const encoder = engine._currentEncoder;
+            for (let i = 0; i < count; i++) {
+                for (const clear of jobs[i]!.clears) {
+                    encoder.clearBuffer(clear.buffer, clear.offset, clear.size);
+                }
+            }
+            const pass = encoder.beginComputePass();
+            let lastPipeline: GPUComputePipeline | null = null;
+            for (let i = 0; i < count; i++) {
+                for (const step of jobs[i]!.steps) {
+                    if (step.pipeline !== lastPipeline) {
+                        pass.setPipeline(step.pipeline);
+                        lastPipeline = step.pipeline;
+                    }
+                    pass.setBindGroup(0, step.bindGroup);
+                    if (step.indirectBuffer) {
+                        pass.dispatchWorkgroupsIndirect(step.indirectBuffer, step.indirectOffset ?? 0);
+                    } else {
+                        pass.dispatchWorkgroups(step.workgroups ?? 0);
+                    }
+                }
+            }
+            pass.end();
+        },
+        destroy(): void {
+            jobs.length = 0;
+            count = 0;
+            _updateBatches?.delete(signature);
+        },
+        queue(job): void {
+            jobs[count++] = job;
+        },
+    };
+    _updateBatches.set(signature, batch);
+    return batch;
+}
+
+/** Result handed to the render binding after selection is queued: the buffers the
+ *  expansion (Task 5.3) and indirect draw consume. */
+export interface MeshLoDGpuSelectionHandles {
+    readonly controlBuffer: GPUBuffer;
+    readonly selectedBuffer: GPUBuffer;
+    readonly bindGroup: GPUBindGroup;
+    readonly selectedCapacity: number;
+    readonly instanceCount: number;
+}
+
+/** Prepare and queue one batch's GPU selection into the shared compute pass: sync page
+ *  state, version-gate instance uploads, size transient buffers, write params, reset
+ *  transient counters, and append the traverse→evaluate→select→demand steps. Returns
+ *  the buffers the expansion + indirect draw consume, or `null` for an empty batch. */
+export function queueMeshLoDGpuSelection(
+    engine: EngineContext,
+    updateBatch: MeshLoDUpdateBatch,
+    runtime: MeshLoDAssetRuntime,
+    instanceState: MeshLoDGpuInstanceState,
+    batchState: MeshLoDGpuBatchState,
+    instances: readonly MeshLoDGpuInstanceInput[],
+    frame: MeshLoDGpuFrameParams
+): MeshLoDGpuSelectionHandles | null {
+    if (instances.length === 0) {
+        return null;
+    }
+    const pipelines = getMeshLoDSelectionPipelines(engine);
+    const assetBuffers = getMeshLoDGpuAssetBuffers(engine, runtime);
+    const instanceCount = uploadMeshLoDInstances(engine, instanceState, instances);
+    syncMeshLoDPageState(engine, assetBuffers, runtime);
+    ensureMeshLoDBatchBuffers(engine, batchState, instanceState.capacity, assetBuffers);
+    ensureMeshLoDBindGroup(engine, batchState, pipelines, assetBuffers, instanceState);
+    writeSelectionParams(batchState, assetBuffers, instanceCount, instanceState.wordsPerInstance, frame);
+    engine._device.queue.writeBuffer(batchState.paramsBuffer!, 0, batchState.paramsBytes, 0, PARAMS_BYTES);
+
+    const bindGroup = batchState.bindGroup!;
+    const groupInvocations = Math.ceil((batchState.groupCount * instanceCount) / SELECTION_WORKGROUP);
+    const nodeInvocations = Math.ceil((batchState.nodeCount * instanceCount) / SELECTION_WORKGROUP);
+    const clusterInvocations = Math.ceil((batchState.clusterCount * instanceCount) / SELECTION_WORKGROUP);
+
+    const job: MeshLoDSelectionJob = {
+        clears: [
+            { buffer: batchState.controlBuffer!, offset: CONTROL_COUNT_WORD * 4, size: 4 },
+            { buffer: batchState.controlBuffer!, offset: CONTROL_DIAG_OFFSET * 4, size: (CONTROL_DIAG_WORDS + Math.max(batchState.pageCount, 1)) * 4 },
+            { buffer: batchState.groupStateBuffer!, offset: 0, size: Math.max(batchState.groupCount * instanceCount, 1) * 4 },
+        ],
+        steps: [
+            { pipeline: pipelines.traverse, bindGroup, workgroups: nodeInvocations },
+            { pipeline: pipelines.evaluate, bindGroup, workgroups: groupInvocations },
+            { pipeline: pipelines.select, bindGroup, workgroups: clusterInvocations },
+            { pipeline: pipelines.demand, bindGroup, workgroups: groupInvocations },
+        ],
+    };
+    updateBatch.queue(job);
+
+    return {
+        controlBuffer: batchState.controlBuffer!,
+        selectedBuffer: batchState.selectedBuffer!,
+        bindGroup,
+        selectedCapacity: batchState.selectedCapacity,
+        instanceCount,
+    };
 }

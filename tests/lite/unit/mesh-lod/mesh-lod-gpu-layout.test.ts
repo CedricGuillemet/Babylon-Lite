@@ -228,13 +228,15 @@ describe("MeshLoD GPU asset buffers", () => {
         expect(runtime.gpuSelection).toBe(buffers);
         // Re-request returns the cached buffers (shared assets reuse immutable buffers).
         expect(getMeshLoDGpuAssetBuffers(engine, runtime)).toBe(buffers);
-        // node/group/cluster/pageref/pagestate buffers were created + written once each.
+        // One consolidated meta buffer + one page-state buffer created & written.
         const labels = device.buffers.map((b) => b.label);
-        expect(labels).toContain("mesh-lod-nodes");
-        expect(labels).toContain("mesh-lod-groups");
-        expect(labels).toContain("mesh-lod-clusters");
-        expect(labels).toContain("mesh-lod-page-refs");
+        expect(labels).toContain("mesh-lod-meta");
         expect(labels).toContain("mesh-lod-page-state");
+        // Concatenation order: nodes(8) ++ groups(16) ++ clusters(16) ++ refs(1).
+        expect(buffers.nodeWordOffset).toBe(0);
+        expect(buffers.groupWordOffset).toBe(NODE_WORDS);
+        expect(buffers.clusterWordOffset).toBe(NODE_WORDS + GROUP_WORDS);
+        expect(buffers.pageRefWordOffset).toBe(NODE_WORDS + GROUP_WORDS + CLUSTER_WORDS);
     });
 
     it("re-uploads page state only after residency changes", () => {
