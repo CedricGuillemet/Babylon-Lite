@@ -12,7 +12,12 @@
 
 import type { EngineContext } from "../engine/engine.js";
 import type { SceneContext } from "../scene/scene-core.js";
-import type { MeshLoDAsset, MeshLoDDebugView, MeshLoDInstance, MeshLoDRequestOptions, MeshLoDSelectionMode, MeshLoDSource } from "./mesh-lod.js";
+import type { MeshLoDAsset, MeshLoDDebugView, MeshLoDDiagnostics, MeshLoDInstance, MeshLoDRequestOptions, MeshLoDSelectionMode, MeshLoDSource } from "./mesh-lod.js";
+import type { ParsedMeshLoDContainer } from "./mesh-lod-format.js";
+import type { MeshLoDRangeSource } from "./mesh-lod-range-source.js";
+import { parseMeshLoDContainer, readBootstrapExtent, toMeshLoDMetadata } from "./mesh-lod-format.js";
+import { BOOTSTRAP_FIRST_END, concatBytes, createMeshLoDRangeSource, throwIfAborted } from "./mesh-lod-range-source.js";
+import { createMeshLoDError } from "./mesh-lod-errors.js";
 /** Effective, fully-resolved runtime settings (defaults applied, values validated). */
 export interface MeshLoDEffectiveSettings {
     screenSpaceError: number;
@@ -148,12 +153,25 @@ export interface MeshLoDPageRecord {
 
 /** Mutable runtime state referenced by `MeshLoDAsset._runtime`.
  *
- *  Only the fields required by the public facade exist today; the resident
- *  metadata, page cache, scheduler, and GPU state fields defined in the
- *  architecture are added by the Phase 3–5 loading/streaming/GPU tasks. */
+ *  Only the fields required so far exist today; the page cache, scheduler, and GPU
+ *  state fields defined in the architecture are added by the Phase 4–6
+ *  loading/streaming/GPU tasks. */
 export interface MeshLoDAssetRuntime {
     readonly engine: EngineContext;
+    readonly source: MeshLoDRangeSource;
+    /** Bytes covering `[0, bootstrapBytes)`: header, directory, metadata, and the
+     *  pinned coarse pages. The complete file for in-memory/200 sources. */
+    readonly coarseBytes: Uint8Array;
+    readonly header: MeshLoDHeader;
+    readonly sections: readonly MeshLoDSectionEntry[];
+    readonly groups: readonly MeshLoDGroup[];
+    readonly clusters: readonly MeshLoDCluster[];
+    readonly hierarchyNodes: readonly MeshLoDHierarchyNode[];
+    readonly pageRecords: readonly MeshLoDPageRecord[];
+    readonly groupPageRefs: Uint32Array;
     readonly settings: MeshLoDEffectiveSettings;
+    /** Live diagnostics object also referenced by `MeshLoDAsset.diagnostics`. */
+    readonly diagnostics: MeshLoDDiagnostics;
     readonly abortController: AbortController;
     /** Bumped on disposal and device recovery to invalidate stale completions. */
     generation: number;
@@ -167,23 +185,115 @@ export interface MeshLoDAssetRuntime {
     disposed: boolean;
 }
 
-/** Load, validate, and register a MeshLoD asset from a resolved settings object.
+/** Writable diagnostics view used while updating the live snapshot. */
+type MeshLoDMutableDiagnostics = { -readonly [K in keyof MeshLoDDiagnostics]: MeshLoDDiagnostics[K] };
+
+function createDiagnostics(
+    parsed: ParsedMeshLoDContainer,
+    settings: MeshLoDEffectiveSettings,
+    selectionMode: MeshLoDSelectionMode,
+    downloadedBytes: number
+): MeshLoDMutableDiagnostics {
+    return {
+        frameIndex: 0,
+        sourceTriangleCount: parsed.header.sourceTriangleCount,
+        renderedTriangleCount: 0,
+        selectedMeshletCount: 0,
+        visibleGroupCount: 0,
+        fallbackGroupCount: 0,
+        maximumSelectedErrorPixels: 0,
+        maximumUnmetErrorPixels: 0,
+        requestedPageCount: 0,
+        queuedPageCount: 0,
+        inFlightPageCount: 0,
+        residentPageCount: 0,
+        pinnedPageCount: parsed.header.pinnedPageCount,
+        terminalFailedPageCount: 0,
+        downloadedBytes,
+        gpuCacheUsedBytes: 0,
+        gpuCacheBudgetBytes: settings.cacheBudgetBytes,
+        gpuCacheCapacityBytes: settings.cacheCapacityBytes,
+        cpuPageCacheUsedBytes: 0,
+        maxConcurrentRequests: settings.maxConcurrentRequests,
+        streamingPaused: false,
+        selectionMode,
+    };
+}
+
+/** Load and validate a MeshLoD asset from a resolved settings object.
  *
- *  Bootstrap (range source), metadata parse/validation, pinned-page decode, and
- *  GPU upload are implemented by the Phase 3/4 loading tasks. Until then this
- *  entry point is not reachable through a completed happy path. */
-export function _loadMeshLoD(
-    _engine: EngineContext,
-    _source: MeshLoDSource,
-    _settings: MeshLoDEffectiveSettings,
-    _selectionMode: MeshLoDSelectionMode,
-    _request: MeshLoDRequestOptions | undefined,
-    _signal: AbortSignal | undefined
+ *  Runs the coarse-first bootstrap: for a complete-file source it validates the
+ *  whole container; for a URL it reads the header (bytes `0-65535`), then reads at
+ *  most one continuation through `bootstrapBytes`, and validates the metadata plus
+ *  pinned pages while deferring fine pages to streaming. Pinned-page GPU decode and
+ *  upload are added by the Phase 4 loading tasks. */
+export async function _loadMeshLoD(
+    engine: EngineContext,
+    source: MeshLoDSource,
+    settings: MeshLoDEffectiveSettings,
+    selectionMode: MeshLoDSelectionMode,
+    request: MeshLoDRequestOptions | undefined,
+    signal: AbortSignal | undefined
 ): Promise<MeshLoDAsset> {
-    // Scaffold: replaced by the range-source bootstrap (T-16) and pinned-page
-    // loading (T-19) tasks, which construct and validate the asset before it
-    // resolves. No completed workflow reaches this throw.
-    throw new Error("MeshLoD loading is not yet implemented in this build");
+    throwIfAborted(signal);
+    const src = await createMeshLoDRangeSource(source, request);
+
+    let parsed: ParsedMeshLoDContainer;
+    let coarseBytes: Uint8Array;
+    if (src.completeBytes) {
+        coarseBytes = src.completeBytes;
+        parsed = parseMeshLoDContainer(coarseBytes);
+    } else {
+        const head = await src.read(0, BOOTSTRAP_FIRST_END, signal);
+        if (src.completeBytes) {
+            // The first response was a full-body 200; use the retained file.
+            coarseBytes = src.completeBytes;
+            parsed = parseMeshLoDContainer(coarseBytes);
+        } else {
+            const extent = readBootstrapExtent(head);
+            if (src.totalBytes !== null && src.totalBytes !== extent.totalFileBytes) {
+                throw createMeshLoDError("MLOD_INVALID_LAYOUT", "transport total disagrees with the header", { expected: extent.totalFileBytes, actual: src.totalBytes });
+            }
+            coarseBytes =
+                head.length >= extent.bootstrapBytes ? head.subarray(0, extent.bootstrapBytes) : concatBytes(head, await src.read(head.length, extent.bootstrapBytes - 1, signal));
+            parsed = parseMeshLoDContainer(coarseBytes);
+        }
+    }
+
+    if (src.totalBytes !== null && src.totalBytes !== parsed.header.totalFileBytes) {
+        throw createMeshLoDError("MLOD_TRUNCATED", "transport total disagrees with the declared file size", { expected: parsed.header.totalFileBytes, actual: src.totalBytes });
+    }
+
+    const diagnostics = createDiagnostics(parsed, settings, selectionMode, src.downloadedBytes);
+    const runtime: MeshLoDAssetRuntime = {
+        engine,
+        source: src,
+        coarseBytes,
+        header: parsed.header,
+        sections: parsed.sections,
+        groups: parsed.groups,
+        clusters: parsed.clusters,
+        hierarchyNodes: parsed.hierarchyNodes,
+        pageRecords: parsed.pageRecords,
+        groupPageRefs: parsed.groupPageRefs,
+        settings,
+        diagnostics,
+        abortController: new AbortController(),
+        generation: 0,
+        frameIndex: 0,
+        streamingPaused: false,
+        debugView: "none",
+        selectionMode,
+        nextInstanceId: 0,
+        disposed: false,
+    };
+
+    return {
+        metadata: toMeshLoDMetadata(parsed),
+        diagnostics,
+        state: "ready",
+        _runtime: runtime,
+    };
 }
 
 /** Register an instance into its scene-owned MeshLoD batch. Implemented by the

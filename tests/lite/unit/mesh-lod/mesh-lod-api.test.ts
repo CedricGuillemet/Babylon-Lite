@@ -44,7 +44,7 @@ function makeFakeAsset(): MeshLoDAsset {
             selectionMode: "gpu",
             nextInstanceId: 0,
             disposed: false,
-        },
+        } as unknown as MeshLoDAsset["_runtime"],
     };
 }
 

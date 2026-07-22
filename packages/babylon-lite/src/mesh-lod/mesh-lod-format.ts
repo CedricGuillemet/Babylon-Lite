@@ -222,7 +222,7 @@ const H = {
     reservedSize: 20,
 } as const;
 
-function parseHeader(reader: Reader): MeshLoDHeader {
+function decodeHeader(reader: Reader): MeshLoDHeader {
     const size = reader.bytes.length;
     if (size < HEADER_SIZE) {
         throw fail("MLOD_TRUNCATED", "file smaller than the header", { expected: HEADER_SIZE, actual: size });
@@ -250,11 +250,9 @@ function parseHeader(reader: Reader): MeshLoDHeader {
         throw fail("MLOD_HEADER_INTEGRITY", "bad header size", { expected: HEADER_SIZE, actual: reader.u32(H.headerBytes) });
     }
     const totalFileBytes = reader.u64(H.totalFileBytes);
-    if (size < totalFileBytes) {
-        throw fail("MLOD_TRUNCATED", "file shorter than the declared size", { expected: totalFileBytes, actual: size });
-    }
-    if (size !== totalFileBytes) {
-        throw fail("MLOD_INVALID_LAYOUT", "buffer size disagrees with the declared size", { expected: totalFileBytes, actual: size });
+    const bootstrapBytes = reader.u64(H.bootstrapBytes);
+    if (bootstrapBytes < HEADER_SIZE || bootstrapBytes > totalFileBytes) {
+        throw fail("MLOD_INVALID_LAYOUT", "bootstrap bytes are out of range", { expected: totalFileBytes, actual: bootstrapBytes });
     }
     if (!reader.allZero(H.reserved, H.reservedSize)) {
         throw fail("MLOD_INVALID_LAYOUT", "header reserved bytes are not zero", { byteOffset: H.reserved });
@@ -280,7 +278,7 @@ function parseHeader(reader: Reader): MeshLoDHeader {
         sectionCount: reader.u32(H.sectionCount),
         directoryOffset: reader.u64(H.directoryOffset),
         directoryBytes: reader.u64(H.directoryBytes),
-        bootstrapBytes: reader.u64(H.bootstrapBytes),
+        bootstrapBytes,
         totalFileBytes,
         sourceSha256: reader.hex(H.sourceDigest, 32),
         buildFingerprintSha256: reader.hex(H.buildFingerprint, 32),
@@ -301,6 +299,20 @@ function parseHeader(reader: Reader): MeshLoDHeader {
         boundsMax: [reader.f32(H.boundsMax), reader.f32(H.boundsMax + 4), reader.f32(H.boundsMax + 8)],
         maxNonterminalError: reader.f32(H.maxNonterminalError),
     };
+}
+
+/** Validate the header and confirm the buffer holds at least the coarse bootstrap
+ *  region (and no more than the declared file). */
+function parseHeader(reader: Reader): MeshLoDHeader {
+    const header = decodeHeader(reader);
+    const size = reader.bytes.length;
+    if (size > header.totalFileBytes) {
+        throw fail("MLOD_INVALID_LAYOUT", "buffer size exceeds the declared file size", { expected: header.totalFileBytes, actual: size });
+    }
+    if (size < header.bootstrapBytes) {
+        throw fail("MLOD_TRUNCATED", "buffer shorter than the coarse bootstrap region", { expected: header.bootstrapBytes, actual: size });
+    }
+    return header;
 }
 
 // ─── Section directory ───────────────────────────────────────────────
@@ -608,6 +620,7 @@ function parsePages(reader: Reader, pageTable: MeshLoDSectionEntry, pageData: Me
         throw fail("MLOD_INVALID_LAYOUT", "page-data element count disagrees with the header");
     }
     const size = header.totalFileBytes;
+    const available = reader.bytes.length;
     const pages: MeshLoDPageRecord[] = [];
     const ranges: Array<[number, number]> = [];
     let previousPageEnd = pageData.offset;
@@ -629,14 +642,19 @@ function parsePages(reader: Reader, pageTable: MeshLoDSectionEntry, pageData: Me
             throw fail("MLOD_INVALID_LAYOUT", "page data is not contiguous", { pageId: p, byteOffset: offset });
         }
         previousPageEnd = offset + storedBytes;
-        if (crc32c(reader.bytes, offset, offset + storedBytes) !== crc) {
-            throw fail("MLOD_PAGE_INTEGRITY", "page CRC mismatch", { pageId: p, byteOffset: offset });
-        }
-        if (reader.ascii(offset + SP.magic, 4) !== STORED_PAGE_MAGIC) {
-            throw fail("MLOD_PAGE_INTEGRITY", "bad stored page magic", { pageId: p, byteOffset: offset });
-        }
-        if (reader.u32(offset + SP.pageId) !== p) {
-            throw fail("MLOD_PAGE_INTEGRITY", "stored page id mismatch", { pageId: p, byteOffset: offset });
+        // Page DATA (CRC + stored-page framing) is validated only for pages present
+        // in the available bytes. During a coarse bootstrap the fine pages are
+        // beyond `available`; they are validated per-page as they stream in.
+        if (offset + storedBytes <= available) {
+            if (crc32c(reader.bytes, offset, offset + storedBytes) !== crc) {
+                throw fail("MLOD_PAGE_INTEGRITY", "page CRC mismatch", { pageId: p, byteOffset: offset });
+            }
+            if (reader.ascii(offset + SP.magic, 4) !== STORED_PAGE_MAGIC) {
+                throw fail("MLOD_PAGE_INTEGRITY", "bad stored page magic", { pageId: p, byteOffset: offset });
+            }
+            if (reader.u32(offset + SP.pageId) !== p) {
+                throw fail("MLOD_PAGE_INTEGRITY", "stored page id mismatch", { pageId: p, byteOffset: offset });
+            }
         }
         const pinned = (flags & PAGE_FLAG_PINNED) !== 0;
         if (pinned !== p < header.pinnedPageCount) {
@@ -717,7 +735,20 @@ function validateHeaderInvariants(header: MeshLoDHeader): void {
 
 // ─── Public entry point ──────────────────────────────────────────────
 
-/** Parse and fully validate a complete `.mlod` container. Throws a stable
+/** Peek the header of a bootstrap chunk (the first read) to learn how many bytes
+ *  the coarse bootstrap region and the full file occupy. Validates only the
+ *  header (magic, version, endian, size, CRC); the caller fetches the remaining
+ *  bootstrap bytes before a full {@link parseMeshLoDContainer}. */
+export function readBootstrapExtent(bytes: Uint8Array): { totalFileBytes: number; bootstrapBytes: number } {
+    const header = decodeHeader(new Reader(bytes));
+    return { totalFileBytes: header.totalFileBytes, bootstrapBytes: header.bootstrapBytes };
+}
+
+/** Parse and validate a `.mlod` container. Accepts either a complete file
+ *  (`bytes.length === totalFileBytes`) or a coarse bootstrap region
+ *  (`bytes.length === bootstrapBytes`): metadata, references, the full page-table
+ *  structure, and pinned pages are always validated; fine-page CRC and framing are
+ *  validated only for pages present in `bytes`. Throws a stable
  *  {@link MeshLoDError} on any malformed, corrupt, truncated, or
  *  version-incompatible input. */
 export function parseMeshLoDContainer(bytes: Uint8Array): ParsedMeshLoDContainer {
