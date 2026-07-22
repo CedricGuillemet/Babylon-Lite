@@ -27,7 +27,17 @@ export interface MockDevice {
     readonly buffers: MockBuffer[];
     readonly writes: BufferWrite[];
     createBuffer(desc: { label?: string; size: number; usage: number }): MockBuffer;
-    readonly queue: { writeBuffer(buffer: MockBuffer, offset: number, data: ArrayBuffer | ArrayBufferView, dataOffset?: number, size?: number): void };
+    createTexture(desc: unknown): { createView(): object; destroy(): void };
+    createSampler(desc?: unknown): object;
+    createShaderModule(desc: { code: string; label?: string }): { code: string };
+    createBindGroupLayout(desc: unknown): object;
+    createBindGroup(desc: unknown): object;
+    createPipelineLayout(desc: unknown): object;
+    createRenderPipeline(desc: unknown): object;
+    readonly queue: {
+        writeBuffer(buffer: MockBuffer, offset: number, data: ArrayBuffer | ArrayBufferView, dataOffset?: number, size?: number): void;
+        writeTexture(...args: unknown[]): void;
+    };
 }
 
 /** Create a mock GPU device. `limitBytes` overrides the reported storage/buffer
@@ -52,14 +62,59 @@ export function createMockDevice(limitBytes = 1024 * 1024 * 1024): MockDevice {
             buffers.push(buffer);
             return buffer;
         },
+        createTexture() {
+            return { createView: () => ({}), destroy: () => {} };
+        },
+        createSampler() {
+            return {};
+        },
+        createShaderModule(desc) {
+            return { code: desc.code };
+        },
+        createBindGroupLayout() {
+            return {};
+        },
+        createBindGroup() {
+            return {};
+        },
+        createPipelineLayout() {
+            return {};
+        },
+        createRenderPipeline() {
+            return {};
+        },
         queue: {
             writeBuffer(buffer, offset, data, dataOffset = 0, size) {
                 const byteLength = size ?? (ArrayBuffer.isView(data) ? data.byteLength - dataOffset : (data as ArrayBuffer).byteLength - dataOffset);
                 writes.push({ buffer, offset, byteLength });
             },
+            writeTexture() {},
         },
     };
     return device;
+}
+
+/** A mock render-pass encoder that records the draw commands it receives. */
+export interface MockRenderPass {
+    readonly setBindGroups: { index: number }[];
+    readonly indirectDraws: { buffer: MockBuffer; offset: number }[];
+    setBindGroup(index: number, group: unknown): void;
+    drawIndirect(buffer: MockBuffer, offset: number): void;
+}
+
+export function createMockRenderPass(): MockRenderPass {
+    const setBindGroups: { index: number }[] = [];
+    const indirectDraws: { buffer: MockBuffer; offset: number }[] = [];
+    return {
+        setBindGroups,
+        indirectDraws,
+        setBindGroup(index) {
+            setBindGroups.push({ index });
+        },
+        drawIndirect(buffer, offset) {
+            indirectDraws.push({ buffer, offset });
+        },
+    };
 }
 
 /** Wrap a mock device as an `EngineContext` for the loader. */
