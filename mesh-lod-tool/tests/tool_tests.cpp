@@ -1,5 +1,6 @@
 #include "cli.h"
 
+#include "hierarchy.h"
 #include "input.h"
 #include "mlod_version.h"
 
@@ -343,6 +344,100 @@ void testIngestion() {
     expectRejected("malformed.gltf", "");
 }
 
+int buildFromFixture(const std::string& name, std::size_t primitiveIndex,
+                     mlod::PrimitiveHierarchy& out, std::string& err) {
+    std::vector<mlod::SourcePrimitive> primitives;
+    const int loadCode = loadFixture(name, primitives, err);
+    if (loadCode != mlod::kExitSuccess) {
+        return loadCode;
+    }
+    if (primitiveIndex >= primitives.size()) {
+        return -1;
+    }
+    mlod::NormalizedPrimitive normalized;
+    std::ostringstream normErr;
+    const int normCode = mlod::normalizePrimitive(primitives[primitiveIndex], normalized, normErr);
+    if (normCode != mlod::kExitSuccess) {
+        err = normErr.str();
+        return normCode;
+    }
+    const mlod::ConversionOptions options;
+    std::ostringstream buildErr;
+    const int buildCode = mlod::buildHierarchy(normalized, options, out, buildErr);
+    err = buildErr.str();
+    return buildCode;
+}
+
+std::uint64_t terminalCoverage(const mlod::PrimitiveHierarchy& h) {
+    std::uint64_t total = 0;
+    for (const mlod::HierarchyGroup& g : h.groups) {
+        if (g.terminal) {
+            total += g.sourceTriangles;
+        }
+    }
+    return total;
+}
+
+void testHierarchy() {
+    const mlod::ConversionOptions options;
+
+    // Single triangle: one terminal group, one cluster, one level.
+    mlod::PrimitiveHierarchy triangle;
+    std::string err;
+    expect(buildFromFixture("triangle_indexed.gltf", 0, triangle, err) == mlod::kExitSuccess,
+           "single triangle builds a hierarchy");
+    expect(triangle.groups.size() == 1 && triangle.clusters.size() == 1,
+           "single triangle yields one group and cluster");
+    expect(!triangle.nodes.empty() && triangle.levelCount == 1, "single triangle is one level");
+    expect(triangle.groups[0].terminal, "the single group is terminal");
+    expect(terminalCoverage(triangle) == triangle.sourceTriangleCount,
+           "single triangle terminal coverage is exact");
+
+    // Displaced grid: multi-level hierarchy with complete coarse coverage.
+    mlod::PrimitiveHierarchy grid;
+    expect(buildFromFixture("grid.gltf", 0, grid, err) == mlod::kExitSuccess,
+           "grid builds a hierarchy");
+    expect(grid.groups.size() > 1 && grid.clusters.size() > 1, "grid emits multiple groups");
+    expect(grid.levelCount >= 2, "grid produces a multi-level hierarchy");
+    expect(!grid.nodes.empty(), "grid emits hierarchy nodes");
+    expect(terminalCoverage(grid) == grid.sourceTriangleCount, "grid terminal coverage is exact");
+    std::ostringstream revalidateErr;
+    expect(mlod::validateHierarchy(grid, options, revalidateErr) == mlod::kExitSuccess,
+           "grid hierarchy re-validates");
+    for (const mlod::HierarchyCluster& c : grid.clusters) {
+        expect(c.triangleCount <= options.meshletMaxTriangles &&
+                   c.vertexCount <= options.meshletMaxVertices,
+               "grid clusters respect meshlet limits");
+    }
+
+    // Two primitives with distinct materials build as independent hierarchies.
+    mlod::PrimitiveHierarchy first;
+    mlod::PrimitiveHierarchy second;
+    expect(buildFromFixture("two_primitives.gltf", 0, first, err) == mlod::kExitSuccess,
+           "first primitive builds");
+    expect(buildFromFixture("two_primitives.gltf", 1, second, err) == mlod::kExitSuccess,
+           "second primitive builds");
+    expect(first.meshIndex == 0 && first.primitiveIndex == 0, "first primitive indices");
+    expect(second.meshIndex == 1 && second.primitiveIndex == 0, "second primitive indices");
+    expect(first.material.hasMaterial && second.material.hasMaterial, "both carry material facts");
+    expect(terminalCoverage(first) == first.sourceTriangleCount &&
+               terminalCoverage(second) == second.sourceTriangleCount,
+           "both primitives have exact terminal coverage");
+
+    // Validation rejects a hierarchy whose coarse coverage is broken.
+    mlod::PrimitiveHierarchy corrupted = grid;
+    corrupted.sourceTriangleCount += 1;
+    std::ostringstream rejectErr;
+    expect(mlod::validateHierarchy(corrupted, options, rejectErr) == mlod::kExitHierarchy,
+           "validation rejects broken terminal coverage");
+
+    mlod::PrimitiveHierarchy oversized = grid;
+    oversized.clusters[0].triangleCount = static_cast<std::uint16_t>(options.meshletMaxTriangles + 1);
+    std::ostringstream oversizedErr;
+    expect(mlod::validateHierarchy(oversized, options, oversizedErr) == mlod::kExitHierarchy,
+           "validation rejects an over-limit cluster");
+}
+
 } // namespace
 
 int main() {
@@ -354,6 +449,7 @@ int main() {
     testNaming();
     testCanonicalOptions();
     testIngestion();
+    testHierarchy();
 
     if (g_failures == 0) {
         std::cout << "all mesh-lod-tool CLI tests passed\n";

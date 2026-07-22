@@ -4,7 +4,6 @@
 
 | M | ID | Task | Skill | Notes |
 |---|---|---|---|---|
-|  | T-09 | Execute implementation-plan/01_04_build_cluster_hierarchy.md | execute-implementation-plan |  |
 |  | T-10 | Execute implementation-plan/02_01_define_binary_contract.md | execute-implementation-plan |  |
 |  | T-11 | Execute implementation-plan/02_02_pack_deterministic_pages.md | execute-implementation-plan |  |
 |  | T-12 | Execute implementation-plan/02_03_write_validate_publish.md | execute-implementation-plan |  |
@@ -47,6 +46,7 @@
 |  | T-06 | Execute implementation-plan/01_01_scaffold_converter.md | execute-implementation-plan | done 2026-07-22 - configure+build+CTest 6/6; meshoptimizer+cgltf pinned to exact SHAs |
 |  | T-07 | Execute implementation-plan/01_02_cli_and_primitive_selection.md | execute-implementation-plan | done 2026-07-22 - full option parse/validation + deterministic primitive naming; CTest 6/6 |
 |  | T-08 | Execute implementation-plan/01_03_normalize_gltf_geometry.md | execute-implementation-plan | done 2026-07-22 - cgltf ingest/validate/select + normalize (indices, angle-weighted normals, bounds); 15 fixtures; CTest 6/6 |
+|  | T-09 | Execute implementation-plan/01_04_build_cluster_hierarchy.md | execute-implementation-plan | done 2026-07-22 - clusterlod DAG + 8-wide forest; exact terminal coverage + reachability validation; grid fixture 6 groups/5 levels; CTest 6/6 |
 
 ## Untriaged
 
