@@ -4,7 +4,6 @@
 
 | M | ID | Task | Skill | Notes |
 |---|---|---|---|---|
-|  | T-19 | Execute implementation-plan/04_02_load_pinned_pages.md | execute-implementation-plan |  |
 |  | T-20 | Execute implementation-plan/04_03_scene_registry_cpu_selection.md | execute-implementation-plan |  |
 |  | T-21 | Execute implementation-plan/04_04_pbr_coarse_indirect_rendering.md | execute-implementation-plan |  |
 |  | T-22 | Execute implementation-plan/04_05_verify_lazy_coarse_path.md | execute-implementation-plan |  |
@@ -47,11 +46,11 @@
 |  | T-16 | Execute implementation-plan/03_03_range_source_bootstrap.md | execute-implementation-plan | done 2026-07-22 - 62b29c8f; range source (URL/ArrayBuffer/Blob) + strict HTTP protocol validation, coarse-first two-request bootstrap, available-aware parse; loadMeshLoD real; +lite-integration vitest project; 71 mesh-lod tests green; lint green |
 |  | T-17 | Execute implementation-plan/03_04_cpu_selection_oracle.md | execute-implementation-plan | done 2026-07-22 - 55e78b91; float32 CPU oracle (traversal, culling, hysteresis, crack-free DAG cut + residency fallback, page demand); ./mesh-lod/testing subpath; committed selection fixtures; 79 mesh-lod tests green; lint green. Phase 3 complete. |
 |  | T-18 | Execute implementation-plan/04_01_lazy_page_decoder.md | execute-implementation-plan | done 2026-07-22 - 04441b02; export shared MeshoptDecoderModule (type-only), mesh-lod-page-decoder with validate-before-codec + ATTRIBUTES/TRIANGLES NONE decode + index-bounds; 6 mock-decoder tests; existing decode-error unchanged; lint green |
+|  | T-19 | Execute implementation-plan/04_02_load_pinned_pages.md | execute-implementation-plan | done 2026-07-22 - da04a99c; loadMeshLoD resolves after arena alloc + pinned decode/upload (fine pages unrequested); mesh-lod-cache 64 KiB block first-fit allocator + pinned accounting + device-limit clamp; MLOD_BUDGET_TOO_SMALL/MLOD_DEVICE_LIMIT; per-page residency retains decoded indices for CPU expansion; decoder-injection seam + mock device/decoder; 17 new + updated loader/options tests; lint green |
+|  | T-39 | Reconcile early mesh-lod-runtime scaffold | execute-implementation-plan | deferred - covered by queued T-20 scene registry |
+|  | T-40 | Add MeshLoD testing export subpath | execute-implementation-plan | done 2026-07-22 - completed within T-17 |
+|  | T-41 | Preserve TypeScript 6 compatibility fixes | execute-implementation-plan | done 2026-07-22 - completed within T-14; no further work |
 
 ## Untriaged
-
-- T-14 created `mesh-lod-runtime.ts` early (plan lists it first under T-15) because the facade must `import type { MeshLoDAssetRuntime }` from it; `_loadMeshLoD`/`_addMeshLoDToScene`/`_removeMeshLoDFromScene` are scaffold throws replaced by the Phase 3/4 loading (T-16) and scene-registry (T-20) tasks.
-- T-14 deferred the `package.json` internal testing subpath to T-17 (where `mesh-lod-testing.ts` is created) to avoid a dangling export target; the CPU-oracle resolver `_resolveMeshLoDLoadOptions` is exported `@internal` from the facade for unit testing in the meantime.
-- Incidental pre-existing repo-wide `tsc` failures under the installed toolchain (TypeScript 6.0.3 / @webgpu/types 0.1.69) were fixed to get a green `pnpm run lint`: `picking-advanced-pipeline.ts` readonly vertex buffers, `scripts/lite-error-plugin.ts` undefined guards. Also added `mesh-lod-tool/build/**` to ESLint ignores.
 
 <!-- END OF BOARD -->
