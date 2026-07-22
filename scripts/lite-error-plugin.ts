@@ -85,6 +85,9 @@ function candidateFor(node: ts.ThrowStatement, sf: ts.SourceFile): Candidate | n
         return null;
     }
     const arg = args[0];
+    if (!arg) {
+        return null;
+    }
 
     let tableFnSource: string;
     const argTexts: string[] = [];
@@ -136,7 +139,7 @@ export function liteErrorPlugin(): Plugin {
     const plans = new Map<string, FilePlan>(); // normalized abs path -> plan
     let tableModuleSource = "";
 
-    const normalize = (id: string): string => path.resolve(id.split("?")[0]).replace(/\\/g, "/");
+    const normalize = (id: string): string => path.resolve(id.split("?")[0] ?? id).replace(/\\/g, "/");
 
     return {
         name: "lite-error",
@@ -211,6 +214,9 @@ export function liteErrorPlugin(): Plugin {
             let out = code;
             for (let i = candidates.length - 1; i >= 0; i--) {
                 const c = candidates[i];
+                if (!c) {
+                    continue;
+                }
                 const callArgs = c.argTexts.length ? ", " + c.argTexts.join(", ") : "";
                 const replacement = `ThrowLiteError(${plan.codes[i]}${callArgs})`;
                 out = out.slice(0, c.start) + replacement + out.slice(c.end);
