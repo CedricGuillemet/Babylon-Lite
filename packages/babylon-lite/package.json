@@ -34,6 +34,10 @@
         "./engine/device-lost-recovery-testing": {
             "import": "./src/engine/device-lost-recovery-testing.ts",
             "types": "./src/engine/device-lost-recovery-testing.ts"
+        },
+        "./mesh-lod/testing": {
+            "import": "./src/mesh-lod/mesh-lod-testing.ts",
+            "types": "./src/mesh-lod/mesh-lod-testing.ts"
         }
     },
     "files": [
