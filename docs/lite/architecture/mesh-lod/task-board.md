@@ -4,7 +4,6 @@
 
 | M | ID | Task | Skill | Notes |
 |---|---|---|---|---|
-|  | T-11 | Execute implementation-plan/02_02_pack_deterministic_pages.md | execute-implementation-plan |  |
 |  | T-12 | Execute implementation-plan/02_03_write_validate_publish.md | execute-implementation-plan |  |
 |  | T-13 | Execute implementation-plan/02_04_converter_fixtures_and_statue.md | execute-implementation-plan |  |
 |  | T-14 | Execute implementation-plan/03_01_public_api_and_errors.md | execute-implementation-plan |  |
@@ -47,6 +46,7 @@
 |  | T-08 | Execute implementation-plan/01_03_normalize_gltf_geometry.md | execute-implementation-plan | done 2026-07-22 - cgltf ingest/validate/select + normalize (indices, angle-weighted normals, bounds); 15 fixtures; CTest 6/6 |
 |  | T-09 | Execute implementation-plan/01_04_build_cluster_hierarchy.md | execute-implementation-plan | done 2026-07-22 - clusterlod DAG + 8-wide forest; exact terminal coverage + reachability validation; grid fixture 6 groups/5 levels; CTest 6/6 |
 |  | T-10 | Execute implementation-plan/02_01_define_binary_contract.md | execute-implementation-plan | done 2026-07-22 - mlod_format.h layout constants + LE/checked helpers; CRC32C + SHA-256 with published vectors; source/build fingerprints; format_vectors test; CTest 7/7 |
+|  | T-11 | Execute implementation-plan/02_02_pack_deterministic_pages.md | execute-implementation-plan | done 2026-07-22 - deterministic 64-256KiB page packing (meshopt vertex/index streams, oct-normal+half UV), pinned prefix, decode round-trip + byte-identical repack; CTest 7/7 |
 
 ## Untriaged
 

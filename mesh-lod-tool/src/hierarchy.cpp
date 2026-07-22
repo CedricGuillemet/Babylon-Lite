@@ -159,6 +159,7 @@ int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions
                   g.firstCluster = static_cast<std::uint32_t>(clusters.size());
                   g.clusterCount = static_cast<std::uint32_t>(count);
                   g.terminal = group.simplified.error == FLT_MAX;
+                  g.pinned = g.terminal;
 
                   for (size_t i = 0; i < count; ++i) {
                       const clodCluster& c = groupClusters[i];

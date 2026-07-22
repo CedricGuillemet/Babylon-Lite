@@ -35,5 +35,7 @@ set_tests_properties(cli_unknown_arg PROPERTIES WILL_FAIL TRUE)
 add_executable(mesh-lod-format-tests format_tests.cpp)
 target_link_libraries(mesh-lod-format-tests PRIVATE mesh-lod-tool-core)
 target_include_directories(mesh-lod-format-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_definitions(mesh-lod-format-tests PRIVATE
+    MLOD_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 mlod_set_project_warnings(mesh-lod-format-tests)
 add_test(NAME format_vectors COMMAND mesh-lod-format-tests)

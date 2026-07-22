@@ -21,6 +21,9 @@ struct HierarchyCluster {
     std::uint16_t vertexCount = 0;
     std::uint16_t triangleCount = 0;
     std::uint32_t sourceTriangles = 0; // original triangles this cluster represents
+    std::uint32_t pageId = 0;              // assigned by page packing
+    std::uint32_t firstVertexInPage = 0;   // vertex base within the decoded page
+    std::uint32_t firstLocalIndexInPage = 0; // index base (u16 elements) within the page
     std::vector<std::uint32_t> globalIndices;  // triangleCount*3, into primitive vertices
     std::vector<std::uint32_t> localVertices;  // vertexCount unique source vertex ids
     std::vector<std::uint16_t> localTriangles; // triangleCount*3 indices into localVertices
@@ -35,6 +38,9 @@ struct HierarchyGroup {
     std::uint32_t firstCluster = 0;
     std::uint32_t clusterCount = 0;
     bool terminal = false;
+    bool pinned = false; // terminal (coarse) groups whose pages are pinned
+    std::uint32_t firstPageRef = 0;  // index into GROUP_PAGE_REFS, set by packing
+    std::uint16_t pageRefCount = 0;  // distinct pages referenced by the group
     std::uint32_t sourceTriangles = 0;  // original triangles represented by the group
     std::uint32_t emittedTriangles = 0; // triangles in the group's emitted clusters
 };

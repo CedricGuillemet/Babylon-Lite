@@ -1,13 +1,19 @@
 #include "cli.h"
 #include "crc32c.h"
+#include "hierarchy.h"
+#include "input.h"
 #include "mlod_format.h"
 #include "mlod_version.h"
+#include "normalize.h"
+#include "page_packer.h"
 #include "sha256.h"
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -163,6 +169,177 @@ void testBuildFingerprint() {
            "build fingerprint reflects conversion options");
 }
 
+std::string fixture(const std::string& name) {
+    return std::string(MLOD_FIXTURES_DIR) + "/" + name;
+}
+
+int buildPacked(const std::string& name, const mlod::ConversionOptions& options,
+                mlod::NormalizedPrimitive& normalized, mlod::PrimitiveHierarchy& hierarchy,
+                mlod::PackedGeometry& packed) {
+    mlod::ConversionOptions loadOptions = options;
+    loadOptions.inputPath = fixture(name);
+    loadOptions.outputPath = "out.mlod";
+    std::vector<mlod::SourcePrimitive> primitives;
+    std::ostringstream errStream;
+    if (mlod::loadSourcePrimitives(loadOptions, primitives, errStream) != mlod::kExitSuccess ||
+        primitives.empty()) {
+        return -1;
+    }
+    if (mlod::normalizePrimitive(primitives[0], normalized, errStream) != mlod::kExitSuccess) {
+        return -1;
+    }
+    if (mlod::buildHierarchy(normalized, loadOptions, hierarchy, errStream) != mlod::kExitSuccess) {
+        return -1;
+    }
+    return mlod::packPages(hierarchy, normalized, loadOptions, packed, errStream);
+}
+
+void verifyPageRoundTrip(const mlod::PrimitiveHierarchy& hierarchy,
+                         const mlod::NormalizedPrimitive& primitive,
+                         const mlod::PackedPage& page) {
+    std::vector<unsigned char> vertices;
+    std::vector<std::uint16_t> indices;
+    std::ostringstream errStream;
+    expect(mlod::decodeStoredPage(page.storedBytes.data(), page.storedBytes.size(), vertices,
+                                  indices, errStream) == mlod::kExitSuccess,
+           "stored page decodes");
+    expect(vertices.size() == static_cast<std::size_t>(page.vertexCount) * 24,
+           "decoded vertex byte count matches");
+    expect(indices.size() == page.localIndexCount, "decoded index count matches");
+
+    // Verify every cluster in the page reconstructs its geometry.
+    for (const mlod::HierarchyCluster& c : hierarchy.clusters) {
+        if (c.pageId != page.pageId) {
+            continue;
+        }
+        for (std::uint16_t k = 0; k < c.vertexCount; ++k) {
+            const std::uint32_t sourceVertex = c.localVertices[k];
+            const std::size_t base = (static_cast<std::size_t>(c.firstVertexInPage) + k) * 24;
+            const float px = mlod::le::readF32(&vertices[base + 0]);
+            const float py = mlod::le::readF32(&vertices[base + 4]);
+            const float pz = mlod::le::readF32(&vertices[base + 8]);
+            expect(px == primitive.positions[sourceVertex * 3 + 0] &&
+                       py == primitive.positions[sourceVertex * 3 + 1] &&
+                       pz == primitive.positions[sourceVertex * 3 + 2],
+                   "decoded position is exact");
+            float nx = 0.0f;
+            float ny = 0.0f;
+            float nz = 0.0f;
+            mlod::octDecodeNormal(static_cast<std::int16_t>(mlod::le::readU16(&vertices[base + 12])),
+                                  static_cast<std::int16_t>(mlod::le::readU16(&vertices[base + 14])),
+                                  nx, ny, nz);
+            const float dot = nx * primitive.normals[sourceVertex * 3 + 0] +
+                              ny * primitive.normals[sourceVertex * 3 + 1] +
+                              nz * primitive.normals[sourceVertex * 3 + 2];
+            expect(dot > 0.99f, "decoded normal is within packing precision");
+        }
+        // Each cluster triangle round-trips as the same set of source vertices.
+        // meshopt's index codec preserves triangles up to winding-preserving
+        // rotation, so triangles are compared as sets of decoded positions.
+        for (std::uint16_t t = 0; t < c.triangleCount; ++t) {
+            std::array<std::array<float, 3>, 3> decodedTri;
+            std::array<std::array<float, 3>, 3> expectedTri;
+            for (int corner = 0; corner < 3; ++corner) {
+                const std::uint16_t pageIndex =
+                    indices[c.firstLocalIndexInPage + static_cast<std::size_t>(t) * 3 + corner];
+                const std::size_t vbase = static_cast<std::size_t>(pageIndex) * 24;
+                decodedTri[static_cast<std::size_t>(corner)] = {
+                    mlod::le::readF32(&vertices[vbase + 0]), mlod::le::readF32(&vertices[vbase + 4]),
+                    mlod::le::readF32(&vertices[vbase + 8])};
+                const std::uint32_t sourceVertex =
+                    c.globalIndices[static_cast<std::size_t>(t) * 3 + corner];
+                expectedTri[static_cast<std::size_t>(corner)] = {
+                    primitive.positions[sourceVertex * 3 + 0],
+                    primitive.positions[sourceVertex * 3 + 1],
+                    primitive.positions[sourceVertex * 3 + 2]};
+            }
+            bool matched = true;
+            for (const auto& expectedCorner : expectedTri) {
+                bool found = false;
+                for (const auto& decodedCorner : decodedTri) {
+                    if (decodedCorner == expectedCorner) {
+                        found = true;
+                    }
+                }
+                matched = matched && found;
+            }
+            expect(matched, "decoded triangle maps to the correct source vertices");
+        }
+    }
+}
+
+void testPagePacking() {
+    // Grid: multi-page packing with pinned prefix and exact decode round trip.
+    mlod::ConversionOptions options;
+    mlod::NormalizedPrimitive gridNormalized;
+    mlod::PrimitiveHierarchy gridHierarchy;
+    mlod::PackedGeometry gridPacked;
+    expect(buildPacked("grid.gltf", options, gridNormalized, gridHierarchy, gridPacked) ==
+               mlod::kExitSuccess,
+           "grid packs successfully");
+    expect(!gridPacked.pages.empty(), "grid produces pages");
+    expect(gridPacked.pinnedPageCount >= 1, "grid pins at least one page");
+
+    bool pinnedPrefix = true;
+    for (std::uint32_t i = 0; i < gridPacked.pages.size(); ++i) {
+        const bool shouldPin = i < gridPacked.pinnedPageCount;
+        if (gridPacked.pages[i].pinned != shouldPin) {
+            pinnedPrefix = false;
+        }
+        const std::size_t size = gridPacked.pages[i].storedBytes.size();
+        expect(size >= 65536 && size <= 262144 && size % 65536 == 0,
+               "stored page respects 64-256 KiB alignment");
+    }
+    expect(pinnedPrefix, "pinned pages form a contiguous prefix");
+
+    for (const mlod::PackedPage& page : gridPacked.pages) {
+        verifyPageRoundTrip(gridHierarchy, gridNormalized, page);
+    }
+
+    // Determinism: a second independent pack is byte-identical.
+    mlod::NormalizedPrimitive gridNormalized2;
+    mlod::PrimitiveHierarchy gridHierarchy2;
+    mlod::PackedGeometry gridPacked2;
+    expect(buildPacked("grid.gltf", options, gridNormalized2, gridHierarchy2, gridPacked2) ==
+               mlod::kExitSuccess,
+           "grid re-packs successfully");
+    bool identical = gridPacked.pages.size() == gridPacked2.pages.size();
+    for (std::size_t i = 0; identical && i < gridPacked.pages.size(); ++i) {
+        identical = gridPacked.pages[i].storedBytes == gridPacked2.pages[i].storedBytes &&
+                    gridPacked.pages[i].crc == gridPacked2.pages[i].crc;
+    }
+    expect(identical, "repeated packing is byte-identical");
+
+    // Single triangle: one pinned 64 KiB page.
+    mlod::NormalizedPrimitive triNormalized;
+    mlod::PrimitiveHierarchy triHierarchy;
+    mlod::PackedGeometry triPacked;
+    expect(buildPacked("triangle_indexed.gltf", options, triNormalized, triHierarchy, triPacked) ==
+               mlod::kExitSuccess,
+           "triangle packs successfully");
+    expect(triPacked.pages.size() == 1 && triPacked.pinnedPageCount == 1,
+           "triangle yields a single pinned page");
+    expect(triPacked.pages[0].storedBytes.size() == 65536, "triangle page is the 64 KiB minimum");
+
+    // Forced smaller pages: reduce the maximum so a group must split, and confirm
+    // the result still validates and round-trips.
+    mlod::ConversionOptions small = options;
+    small.pageMinKiB = 64;
+    small.pageTargetKiB = 64;
+    small.pageMaxKiB = 64;
+    mlod::NormalizedPrimitive smallNormalized;
+    mlod::PrimitiveHierarchy smallHierarchy;
+    mlod::PackedGeometry smallPacked;
+    expect(buildPacked("grid.gltf", small, smallNormalized, smallHierarchy, smallPacked) ==
+               mlod::kExitSuccess,
+           "grid packs with 64 KiB pages");
+    expect(smallPacked.pages.size() >= gridPacked.pages.size(),
+           "smaller pages produce at least as many pages");
+    for (const mlod::PackedPage& page : smallPacked.pages) {
+        expect(page.storedBytes.size() == 65536, "forced-small pages are all 64 KiB");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -173,6 +350,7 @@ int main() {
     testSha256();
     testSourceDigest();
     testBuildFingerprint();
+    testPagePacking();
 
     if (g_failures == 0) {
         std::cout << "all mesh-lod-tool format tests passed\n";
