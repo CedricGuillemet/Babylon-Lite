@@ -4,7 +4,6 @@
 
 | M | ID | Task | Skill | Notes |
 |---|---|---|---|---|
-|  | T-21 | Execute implementation-plan/04_04_pbr_coarse_indirect_rendering.md | execute-implementation-plan |  |
 |  | T-22 | Execute implementation-plan/04_05_verify_lazy_coarse_path.md | execute-implementation-plan |  |
 |  | T-23 | Execute implementation-plan/05_01_gpu_metadata_buffers.md | execute-implementation-plan |  |
 |  | T-24 | Execute implementation-plan/05_02_gpu_selection_compute.md | execute-implementation-plan |  |
@@ -47,6 +46,7 @@
 |  | T-18 | Execute implementation-plan/04_01_lazy_page_decoder.md | execute-implementation-plan | done 2026-07-22 - 04441b02; export shared MeshoptDecoderModule (type-only), mesh-lod-page-decoder with validate-before-codec + ATTRIBUTES/TRIANGLES NONE decode + index-bounds; 6 mock-decoder tests; existing decode-error unchanged; lint green |
 |  | T-19 | Execute implementation-plan/04_02_load_pinned_pages.md | execute-implementation-plan | done 2026-07-22 - da04a99c; loadMeshLoD resolves after arena alloc + pinned decode/upload (fine pages unrequested); mesh-lod-cache 64 KiB block first-fit allocator + pinned accounting + device-limit clamp; MLOD_BUDGET_TOO_SMALL/MLOD_DEVICE_LIMIT; per-page residency retains decoded indices for CPU expansion; decoder-injection seam + mock device/decoder; 17 new + updated loader/options tests; lint green |
 |  | T-20 | Execute implementation-plan/04_03_scene_registry_cpu_selection.md | execute-implementation-plan | done 2026-07-22 - bc8c9e00; mesh-lod-scene registry batches by exact asset+material identity, idempotent add/remove, one deferred builder/registry, scene-only _meshLoDRegistry (type-only), one-way ownership; validateSupportedPbrSubset -> MLOD_UNSUPPORTED_MATERIAL; selectMeshLoDBatch runs CPU oracle per visible instance (culling off) with hysteresis + pinned residency; runtime delegation; PBR renderable scaffold; 11 registry tests; lint green |
+|  | T-21 | Execute implementation-plan/04_04_pbr_coarse_indirect_rendering.md | execute-implementation-plan | done 2026-07-22 - e5d8f96b; pbr-mesh-lod-compose (storage-fetch vertex: oct-normal/half-UV unpack + instance world/cofactor-normal; PBR/unlit fragment: SH IBL + scene lights UBO) + pbr-mesh-lod-renderable (fixed group-1 BGL, 1x1 fallbacks, per-frame CPU expand, one pass.drawIndirect/batch, no vertex/index buffers); generic renderer sees an ordinary opaque Renderable. Browser-verified in real WebGPU: statue coarse 46-tri terminal LOD renders unlit + PBR-lit via 1 indirect draw, 1 resident pinned page. GPU-mock render extension + coarse-render integration test (5). lint green |
 |  | T-39 | Reconcile early mesh-lod-runtime scaffold | execute-implementation-plan | deferred - covered by queued T-20 scene registry |
 |  | T-40 | Add MeshLoD testing export subpath | execute-implementation-plan | done 2026-07-22 - completed within T-17 |
 |  | T-41 | Preserve TypeScript 6 compatibility fixes | execute-implementation-plan | done 2026-07-22 - completed within T-14; no further work |
