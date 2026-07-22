@@ -22,6 +22,7 @@ import type { MeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDArena } from "./mesh-lod-cache.js";
 import { allocateArenaRun, arenaUsedBytes, createMeshLoDArena, floorToBlocks, pinnedAllocationBytes } from "./mesh-lod-cache.js";
 import { decodeMeshLoDPage, getMeshLoDPageDecoder } from "./mesh-lod-page-decoder.js";
+import { addMeshLoDInstanceToScene, removeMeshLoDInstanceFromScene } from "./mesh-lod-scene.js";
 /** Effective, fully-resolved runtime settings (defaults applied, values validated). */
 export interface MeshLoDEffectiveSettings {
     screenSpaceError: number;
@@ -408,16 +409,14 @@ export async function _loadMeshLoD(
     };
 }
 
-/** Register an instance into its scene-owned MeshLoD batch. Implemented by the
- *  scene-registry task (T-20). */
-export function _addMeshLoDToScene(_scene: SceneContext, _instance: MeshLoDInstance): void {
-    // Scaffold: replaced by the lazy scene registry (T-20).
-    throw new Error("MeshLoD scene registration is not yet implemented in this build");
+/** Register an instance into its scene-owned MeshLoD batch (delegates to the scene
+ *  registry module). */
+export function _addMeshLoDToScene(scene: SceneContext, instance: MeshLoDInstance): void {
+    addMeshLoDInstanceToScene(scene, instance);
 }
 
-/** Remove an instance from its scene-owned MeshLoD batch. Implemented by the
- *  scene-registry task (T-20). */
-export function _removeMeshLoDFromScene(_scene: SceneContext, _instance: MeshLoDInstance): void {
-    // Scaffold: replaced by the lazy scene registry (T-20).
-    throw new Error("MeshLoD scene removal is not yet implemented in this build");
+/** Remove an instance from its scene-owned MeshLoD batch (delegates to the scene
+ *  registry module). */
+export function _removeMeshLoDFromScene(scene: SceneContext, instance: MeshLoDInstance): void {
+    removeMeshLoDInstanceFromScene(scene, instance);
 }

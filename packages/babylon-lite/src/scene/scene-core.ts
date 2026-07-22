@@ -24,6 +24,7 @@ import type { SceneLightGpuState } from "../render/lights-ubo.js";
 import type { ClusteredLightContainer } from "../light/clustered.js";
 import type { PickSource } from "../picking/pick-contributor.js";
 import type { ToneMapping } from "../material/pbr/tone-mapping.js";
+import type { MeshLoDSceneRegistry } from "../mesh-lod/mesh-lod-scene.js";
 
 /** Image processing configuration. */
 export interface ImageProcessingConfig {
@@ -157,6 +158,11 @@ export interface SceneContext extends RenderingContext {
     _clusteredLightContainer?: ClusteredLightContainer;
     /** @internal Updates clustered light cells for the camera used by the current render pass. */
     _clusteredLightUpdater?: (camera: Camera | null | undefined, targetWidth: number, targetHeight: number) => void;
+
+    /** @internal Optional scene-owned MeshLoD registry. Populated lazily by the
+     *  MeshLoD feature's `addMeshLoDToScene`; absent (and zero-cost) for every scene
+     *  that never uses MeshLoD. */
+    _meshLoDRegistry?: MeshLoDSceneRegistry;
 }
 
 /** Options passed to the scene-context factory. */
