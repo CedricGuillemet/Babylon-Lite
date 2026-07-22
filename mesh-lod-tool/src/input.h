@@ -1,7 +1,11 @@
 #ifndef MLOD_INPUT_H
 #define MLOD_INPUT_H
 
+#include "cli.h"
+#include "normalize.h"
+
 #include <cstdint>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -13,6 +17,16 @@ struct SelectedPrimitive {
     std::uint32_t meshIndex = 0;
     std::uint32_t primitiveIndex = 0;
 };
+
+// Parses and validates a glTF/GLB document with cgltf, selects primitives
+// according to options (a specific primitive, a whole mesh, or every supported
+// primitive), and reads each selected primitive into a SourcePrimitive with its
+// material facts. Rejects every unsupported source feature/layout with an
+// explicit diagnostic that includes mesh/primitive/accessor/extension context.
+// Returns kExitSuccess, or an ExitCode (2 selection, 3 I/O, 4 malformed,
+// 5 unsupported).
+int loadSourcePrimitives(const ConversionOptions& options, std::vector<SourcePrimitive>& out,
+                         std::ostream& err);
 
 // Derives the sibling output path for a single primitive by inserting
 // ".meshNNN.primNNN" (three-digit, zero-padded source indices) before the

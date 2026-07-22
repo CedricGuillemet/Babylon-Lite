@@ -2,6 +2,9 @@ add_executable(mesh-lod-tool-tests tool_tests.cpp)
 target_link_libraries(mesh-lod-tool-tests PRIVATE mesh-lod-tool-core)
 # White-box access to internal converter headers (cli.h and friends).
 target_include_directories(mesh-lod-tool-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+# Checked-in ingestion fixtures resolved by absolute path at test time.
+target_compile_definitions(mesh-lod-tool-tests PRIVATE
+    MLOD_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 mlod_set_project_warnings(mesh-lod-tool-tests)
 
 # In-process smoke assertions: exit codes, help contents, and the exact pinned

@@ -235,6 +235,114 @@ void testCanonicalOptions() {
            "canonical options reflect knob changes");
 }
 
+std::string fixture(const std::string& name) {
+    return std::string(MLOD_FIXTURES_DIR) + "/" + name;
+}
+
+int loadFixture(const std::string& name, std::vector<mlod::SourcePrimitive>& out, std::string& err) {
+    mlod::ConversionOptions options;
+    options.inputPath = fixture(name);
+    options.outputPath = "out.mlod";
+    std::ostringstream errStream;
+    const int code = mlod::loadSourcePrimitives(options, out, errStream);
+    err = errStream.str();
+    return code;
+}
+
+// Loads then normalizes the first primitive, returning the first non-success code.
+int loadAndNormalize(const std::string& name, mlod::NormalizedPrimitive& out, std::string& err) {
+    std::vector<mlod::SourcePrimitive> primitives;
+    const int loadCode = loadFixture(name, primitives, err);
+    if (loadCode != mlod::kExitSuccess) {
+        return loadCode;
+    }
+    std::ostringstream errStream;
+    const int code = mlod::normalizePrimitive(primitives[0], out, errStream);
+    err = errStream.str();
+    return code;
+}
+
+void expectRejected(const std::string& name, const std::string& keyword) {
+    std::string err;
+    mlod::NormalizedPrimitive out;
+    const int code = loadAndNormalize(name, out, err);
+    expect(code == mlod::kExitMalformed || code == mlod::kExitUnsupported,
+           name + " is rejected with exit 4 or 5");
+    if (!keyword.empty()) {
+        expect(contains(err, keyword), name + " diagnostic mentions '" + keyword + "'");
+    }
+}
+
+void testIngestion() {
+    std::string err;
+
+    // Supported: indexed triangle, POSITION only, no material.
+    std::vector<mlod::SourcePrimitive> triangle;
+    expect(loadFixture("triangle_indexed.gltf", triangle, err) == mlod::kExitSuccess,
+           "indexed triangle loads");
+    expect(triangle.size() == 1, "one primitive selected");
+    expect(triangle[0].vertexCount == 3, "triangle has three vertices");
+    expect(triangle[0].normals.empty(), "source triangle has no normals");
+    expect(triangle[0].indices.size() == 3, "triangle indices read");
+
+    mlod::NormalizedPrimitive triNorm;
+    expect(loadAndNormalize("triangle_indexed.gltf", triNorm, err) == mlod::kExitSuccess,
+           "indexed triangle normalizes");
+    expect(triNorm.normals.size() == 9, "normals generated for all vertices");
+    expect(triNorm.normals[2] > 0.99f, "generated normal points +Z");
+    expect(triNorm.triangleCount() == 1, "one triangle after normalization");
+
+    // GLB ingestion must be equivalent to the glTF form.
+    std::vector<mlod::SourcePrimitive> triangleGlb;
+    expect(loadFixture("triangle_indexed.glb", triangleGlb, err) == mlod::kExitSuccess,
+           "GLB triangle loads");
+    expect(triangleGlb.size() == 1 && triangleGlb[0].positions == triangle[0].positions,
+           "GLB and glTF positions are equivalent");
+    expect(triangleGlb[0].indices == triangle[0].indices, "GLB and glTF indices are equivalent");
+
+    // Unindexed input becomes valid indexed geometry.
+    std::vector<mlod::SourcePrimitive> unindexed;
+    expect(loadFixture("triangle_unindexed.gltf", unindexed, err) == mlod::kExitSuccess,
+           "unindexed triangle loads");
+    expect(unindexed[0].indices.empty(), "unindexed source has no indices");
+    mlod::NormalizedPrimitive unindexedNorm;
+    expect(loadAndNormalize("triangle_unindexed.gltf", unindexedNorm, err) == mlod::kExitSuccess,
+           "unindexed triangle normalizes");
+    expect(unindexedNorm.indices.size() == 3, "sequential indices synthesized");
+    expect(unindexedNorm.indices[0] == 0 && unindexedNorm.indices[1] == 1 &&
+               unindexedNorm.indices[2] == 2,
+           "synthesized indices are sequential");
+
+    // Full attributes with an opaque, double-sided, untextured material.
+    std::vector<mlod::SourcePrimitive> quad;
+    expect(loadFixture("quad_textured.gltf", quad, err) == mlod::kExitSuccess, "quad loads");
+    expect(!quad[0].normals.empty() && !quad[0].uvs.empty(), "quad has normals and UVs");
+    expect(quad[0].material.hasMaterial && quad[0].material.doubleSided,
+           "quad material facts captured");
+    expect(!quad[0].material.requiresUv, "untextured material does not require UV");
+    mlod::NormalizedPrimitive quadNorm;
+    expect(loadAndNormalize("quad_textured.gltf", quadNorm, err) == mlod::kExitSuccess,
+           "quad normalizes");
+    expect(quadNorm.hasUv && quadNorm.triangleCount() == 2, "quad has UVs and two triangles");
+
+    // Missing file surfaces an I/O error.
+    std::vector<mlod::SourcePrimitive> missing;
+    expect(loadFixture("does_not_exist.gltf", missing, err) == mlod::kExitIo,
+           "missing input is an I/O error");
+
+    // Every required rejection class fails with exit 4 or 5 and context.
+    expectRejected("points.gltf", "TRIANGLES");
+    expectRejected("skinned.gltf", "");
+    expectRejected("morph.gltf", "morph");
+    expectRejected("alpha_blend.gltf", "alpha");
+    expectRejected("transmission.gltf", "transmission");
+    expectRejected("draco.gltf", "draco");
+    expectRejected("sparse.gltf", "sparse");
+    expectRejected("textured_no_uv.gltf", "TEXCOORD_0");
+    expectRejected("bad_index.gltf", "index");
+    expectRejected("malformed.gltf", "");
+}
+
 } // namespace
 
 int main() {
@@ -245,6 +353,7 @@ int main() {
     testErrors();
     testNaming();
     testCanonicalOptions();
+    testIngestion();
 
     if (g_failures == 0) {
         std::cout << "all mesh-lod-tool CLI tests passed\n";

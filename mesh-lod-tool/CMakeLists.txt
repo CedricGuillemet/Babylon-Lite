@@ -27,7 +27,9 @@ set(MLOD_COMPILER_TARGET
     "${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}-${CMAKE_SYSTEM_PROCESSOR}")
 
 add_library(mesh-lod-tool-core STATIC
-    src/cli.cpp)
+    src/cli.cpp
+    src/input.cpp
+    src/normalize.cpp)
 target_include_directories(mesh-lod-tool-core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
