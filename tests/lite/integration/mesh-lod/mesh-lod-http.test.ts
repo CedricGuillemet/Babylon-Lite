@@ -8,13 +8,23 @@
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { loadMeshLoD } from "../../../../packages/babylon-lite/src/mesh-lod/mesh-lod.js";
 import { isMeshLoDError } from "../../../../packages/babylon-lite/src/mesh-lod/mesh-lod-errors.js";
-import type { EngineContext } from "../../../../packages/babylon-lite/src/engine/engine.js";
+import { _setMeshLoDPageDecoder } from "../../../../packages/babylon-lite/src/mesh-lod/mesh-lod-page-decoder.js";
 import { buildMinimalContainer } from "../../unit/mesh-lod/fixtures/mlod-fixture.js";
+import { createFillDecoder, createMockEngine } from "../../unit/mesh-lod/fixtures/gpu-mock.js";
 
-const engine = {} as EngineContext;
+const { engine } = createMockEngine();
+
+// The loader now decodes + uploads pinned pages, so every load needs a device and
+// a decoder. Inject the fill decoder (no WASM) before each case and clear it after.
+beforeEach(() => {
+    _setMeshLoDPageDecoder(createFillDecoder().decoder);
+});
+afterAll(() => {
+    _setMeshLoDPageDecoder(null);
+});
 
 /** Copy into a fresh ArrayBuffer accepted as a Response body under TS's stricter
  *  typed-array buffer typing. */

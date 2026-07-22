@@ -18,6 +18,10 @@ import type { MeshLoDRangeSource } from "./mesh-lod-range-source.js";
 import { parseMeshLoDContainer, readBootstrapExtent, toMeshLoDMetadata } from "./mesh-lod-format.js";
 import { BOOTSTRAP_FIRST_END, concatBytes, createMeshLoDRangeSource, throwIfAborted } from "./mesh-lod-range-source.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
+import type { MeshLoDError } from "./mesh-lod-errors.js";
+import type { MeshLoDArena } from "./mesh-lod-cache.js";
+import { allocateArenaRun, arenaUsedBytes, createMeshLoDArena, floorToBlocks, pinnedAllocationBytes } from "./mesh-lod-cache.js";
+import { decodeMeshLoDPage, getMeshLoDPageDecoder } from "./mesh-lod-page-decoder.js";
 /** Effective, fully-resolved runtime settings (defaults applied, values validated). */
 export interface MeshLoDEffectiveSettings {
     screenSpaceError: number;
@@ -151,6 +155,38 @@ export interface MeshLoDPageRecord {
     readonly maxDepth: number;
 }
 
+/** Runtime state of one page. Phase 4 only reaches the pinned-page states
+ *  (`gpu-resident` for pinned pages, `unrequested` for fine pages); the fetching /
+ *  decoding / evicting transitions are added by the streaming tasks. */
+export type MeshLoDPageState = "unrequested" | "cpu-resident" | "gpu-resident" | "terminal-failed" | "disposed";
+
+/** Per-page mutable runtime record. Pinned pages retain their decoded local
+ *  indices so the CPU selection/expansion path can build the coarse draw stream
+ *  without re-decoding; fine pages stay `unrequested` until streaming. */
+export interface MeshLoDPageRuntime {
+    readonly id: number;
+    state: MeshLoDPageState;
+    /** Byte offset within the geometry arena, or `-1` when not resident. */
+    arenaOffset: number;
+    /** Rounded 64 KiB-multiple arena allocation, or `0` when not resident. */
+    arenaBytes: number;
+    /** Byte offset of the page's vertex block within its decoded allocation. */
+    readonly vertexByteOffset: number;
+    /** Decoded `u16` local indices retained for CPU expansion (pinned pages only). */
+    indices: Uint16Array | null;
+    /** Terminal failure recorded for a pinned decode/upload error. */
+    terminalError?: MeshLoDError;
+}
+
+/** GPU-side residency state for one asset: the immutable geometry arena plus the
+ *  per-page runtime table. Created during load once pinned pages are resident. */
+export interface MeshLoDGpuState {
+    readonly arena: MeshLoDArena;
+    /** One record per page, indexed by page id. */
+    readonly pages: readonly MeshLoDPageRuntime[];
+    residentPageCount: number;
+}
+
 /** Mutable runtime state referenced by `MeshLoDAsset._runtime`.
  *
  *  Only the fields required so far exist today; the page cache, scheduler, and GPU
@@ -169,6 +205,8 @@ export interface MeshLoDAssetRuntime {
     readonly hierarchyNodes: readonly MeshLoDHierarchyNode[];
     readonly pageRecords: readonly MeshLoDPageRecord[];
     readonly groupPageRefs: Uint32Array;
+    /** Immutable geometry arena and per-page residency (pinned coarse pages GPU-resident at resolve). */
+    readonly gpu: MeshLoDGpuState;
     readonly settings: MeshLoDEffectiveSettings;
     /** Live diagnostics object also referenced by `MeshLoDAsset.diagnostics`. */
     readonly diagnostics: MeshLoDDiagnostics;
@@ -220,13 +258,81 @@ function createDiagnostics(
     };
 }
 
+/** Decode, upload, and mark GPU-resident every pinned coarse page, and allocate the
+ *  immutable geometry arena. Runs after metadata validation and before the asset is
+ *  registerable. Fine pages are left `unrequested`. Throws before any GPU allocation
+ *  when the configured budget/capacity cannot hold the pinned pages
+ *  (`MLOD_BUDGET_TOO_SMALL`), and surfaces pinned decode/upload failures as terminal
+ *  load failures. */
+async function prepareCoarseResidency(
+    engine: EngineContext,
+    parsed: ParsedMeshLoDContainer,
+    coarseBytes: Uint8Array,
+    settings: MeshLoDEffectiveSettings,
+    signal: AbortSignal | undefined
+): Promise<MeshLoDGpuState> {
+    const pinnedBytes = pinnedAllocationBytes(parsed.pageRecords);
+    // Pinned pages count toward both configured budgets (architecture 11.4).
+    if (floorToBlocks(settings.cacheCapacityBytes) < pinnedBytes) {
+        throw createMeshLoDError("MLOD_BUDGET_TOO_SMALL", "cacheCapacityBytes cannot hold the pinned coarse pages", { expected: pinnedBytes, actual: settings.cacheCapacityBytes });
+    }
+    if (settings.cacheBudgetBytes < pinnedBytes) {
+        throw createMeshLoDError("MLOD_BUDGET_TOO_SMALL", "cacheBudgetBytes cannot hold the pinned coarse pages", { expected: pinnedBytes, actual: settings.cacheBudgetBytes });
+    }
+
+    const arena = createMeshLoDArena(engine, settings.cacheCapacityBytes, pinnedBytes);
+    const pages: MeshLoDPageRuntime[] = parsed.pageRecords.map((record, id) => ({
+        id,
+        state: "unrequested" as MeshLoDPageState,
+        arenaOffset: -1,
+        arenaBytes: 0,
+        vertexByteOffset: record.vertexByteOffset,
+        indices: null,
+    }));
+
+    const decoder = await getMeshLoDPageDecoder();
+    throwIfAborted(signal);
+
+    let residentPageCount = 0;
+    for (let id = 0; id < parsed.pageRecords.length; id++) {
+        const record = parsed.pageRecords[id]!;
+        const page = pages[id]!;
+        if (!record.pinned) {
+            continue; // Fine pages stay unrequested until streaming.
+        }
+        const stored = coarseBytes.subarray(record.offset, record.offset + record.storedBytes);
+        let decoded;
+        try {
+            decoded = decodeMeshLoDPage(stored, record, decoder);
+        } catch (cause) {
+            const error = cause as MeshLoDError;
+            page.state = "terminal-failed";
+            page.terminalError = error;
+            throw error; // A pinned failure fails initialization (architecture 11.3).
+        }
+        const arenaOffset = allocateArenaRun(arena, record.decodedBytes, true);
+        if (arenaOffset === null) {
+            throw createMeshLoDError("MLOD_BUDGET_TOO_SMALL", "pinned pages do not fit the geometry arena", { pageId: id, expected: pinnedBytes });
+        }
+        engine._device.queue.writeBuffer(arena.buffer, arenaOffset, decoded.decoded.buffer as ArrayBuffer, decoded.decoded.byteOffset, decoded.decoded.byteLength);
+        page.arenaOffset = arenaOffset;
+        page.arenaBytes = record.decodedBytes;
+        page.indices = new Uint16Array(decoded.decoded.buffer, decoded.decoded.byteOffset + record.indexByteOffset, record.localIndexCount).slice();
+        page.state = "gpu-resident";
+        residentPageCount++;
+    }
+
+    return { arena, pages, residentPageCount };
+}
+
 /** Load and validate a MeshLoD asset from a resolved settings object.
  *
  *  Runs the coarse-first bootstrap: for a complete-file source it validates the
  *  whole container; for a URL it reads the header (bytes `0-65535`), then reads at
  *  most one continuation through `bootstrapBytes`, and validates the metadata plus
- *  pinned pages while deferring fine pages to streaming. Pinned-page GPU decode and
- *  upload are added by the Phase 4 loading tasks. */
+ *  pinned pages while deferring fine pages to streaming. Pinned pages are then
+ *  decoded and uploaded into the immutable geometry arena; the promise resolves only
+ *  once the complete coarse geometry is GPU-resident. */
 export async function _loadMeshLoD(
     engine: EngineContext,
     source: MeshLoDSource,
@@ -265,6 +371,11 @@ export async function _loadMeshLoD(
     }
 
     const diagnostics = createDiagnostics(parsed, settings, selectionMode, src.downloadedBytes);
+    const gpu = await prepareCoarseResidency(engine, parsed, coarseBytes, settings, signal);
+    diagnostics.residentPageCount = gpu.residentPageCount;
+    diagnostics.gpuCacheUsedBytes = arenaUsedBytes(gpu.arena);
+    diagnostics.gpuCacheCapacityBytes = gpu.arena.capacityBytes;
+    diagnostics.downloadedBytes = src.downloadedBytes;
     const runtime: MeshLoDAssetRuntime = {
         engine,
         source: src,
@@ -276,6 +387,7 @@ export async function _loadMeshLoD(
         hierarchyNodes: parsed.hierarchyNodes,
         pageRecords: parsed.pageRecords,
         groupPageRefs: parsed.groupPageRefs,
+        gpu,
         settings,
         diagnostics,
         abortController: new AbortController(),

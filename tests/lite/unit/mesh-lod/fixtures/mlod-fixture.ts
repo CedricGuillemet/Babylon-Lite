@@ -153,8 +153,21 @@ export function buildMinimalContainer(): Fixture {
     wU16(pageDataOffset + 6, 64); // header bytes
     wU32(pageDataOffset + 8, 0); // pageId
     wU32(pageDataOffset + 12, 0x1 | 0x2); // flags
+    wU32(pageDataOffset + 16, 6); // vertexCount
+    wU32(pageDataOffset + 20, 6); // localIndexCount
+    wU32(pageDataOffset + 24, 64); // encVertexOffset (right after the 64-byte stored header)
+    wU32(pageDataOffset + 28, 16); // encVertexBytes
+    wU32(pageDataOffset + 32, 6 * 24); // decVertexBytes
+    wU32(pageDataOffset + 36, 80); // encIndexOffset
+    wU32(pageDataOffset + 40, 12); // encIndexBytes
+    wU32(pageDataOffset + 44, 6 * 2); // decIndexBytes
     wU32(pageDataOffset + 48, 24); // vertex stride
     wU32(pageDataOffset + 52, 2); // index stride
+    // Dummy encoded streams — a mock decoder ignores their content but the framing
+    // (disjoint, in-bounds ranges) must validate before the codec is invoked.
+    for (let i = 0; i < 28; i++) {
+        bytes[pageDataOffset + 64 + i] = i + 1;
+    }
     wU32(pageTableOffset + 20, crc32c(bytes, pageDataOffset, pageDataOffset + pageBytes));
 
     // ── Directory (sorted by type) ──

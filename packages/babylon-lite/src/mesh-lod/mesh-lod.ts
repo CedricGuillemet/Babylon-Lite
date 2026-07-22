@@ -348,8 +348,8 @@ export function getMeshLoDDiagnostics(asset: MeshLoDAsset): MeshLoDDiagnostics {
     return asset.diagnostics;
 }
 
-/** Dispose an asset: abort outstanding work, invalidate completions, and mark it
- *  disposed. Idempotent. */
+/** Dispose an asset: abort outstanding work, invalidate completions, free the GPU
+ *  arena, and mark it disposed. Idempotent. */
 export function disposeMeshLoDAsset(asset: MeshLoDAsset): void {
     const runtime = asset._runtime;
     if (runtime.disposed) {
@@ -358,5 +358,6 @@ export function disposeMeshLoDAsset(asset: MeshLoDAsset): void {
     runtime.disposed = true;
     runtime.generation += 1;
     runtime.abortController.abort();
+    runtime.gpu?.arena.buffer.destroy?.();
     asset.state = "disposed";
 }

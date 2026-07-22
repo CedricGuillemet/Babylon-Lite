@@ -50,6 +50,13 @@ export interface DecodedMeshLoDPage {
 
 let _decoder: MeshoptDecoderModule | null = null;
 
+/** @internal Pre-seed (or clear) the shared decoder singleton. Used only by unit
+ *  and integration tests to drive the loader with a mock decoder in Node, where the
+ *  real `/meshopt_decoder.js` WASM script cannot load. Passing `null` resets it. */
+export function _setMeshLoDPageDecoder(decoder: MeshoptDecoderModule | null): void {
+    _decoder = decoder;
+}
+
 /** Lazily import and initialize the shared meshopt decoder (script + WASM). */
 export async function getMeshLoDPageDecoder(): Promise<MeshoptDecoderModule> {
     if (_decoder) {
