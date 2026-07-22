@@ -19,12 +19,23 @@ import type { RenderTargetSignature } from "../../engine/render-target.js";
 import { REVERSE_DEPTH_COMPARE, targetSignatureKey } from "../../engine/render-target.js";
 import { getSceneBindGroupLayout } from "../../render/scene-helpers.js";
 import { createEmptyUniformBuffer } from "../../resource/gpu-buffers.js";
+import type { Camera } from "../../camera/camera.js";
+import { getCameraPosition, getViewProjectionMatrix } from "../../camera/camera.js";
 import type { Texture2D } from "../../texture/texture-2d.js";
 import { createSolidTexture2D } from "../../texture/solid-texture.js";
 import type { PbrMaterialProps } from "./pbr-material.js";
 import type { MeshLoDSceneBatch } from "../../mesh-lod/mesh-lod-scene.js";
 import { selectMeshLoDBatch } from "../../mesh-lod/mesh-lod-scene.js";
 import { createMeshLoDError } from "../../mesh-lod/mesh-lod-errors.js";
+import type { MeshLoDGpuBatchState, MeshLoDGpuFrameParams, MeshLoDGpuInstanceState, MeshLoDUpdateBatch } from "../../mesh-lod/mesh-lod-selection-gpu.js";
+import {
+    createMeshLoDGpuBatchState,
+    createMeshLoDGpuInstanceState,
+    disposeMeshLoDGpuBatchState,
+    disposeMeshLoDGpuInstanceState,
+    getMeshLoDUpdateBatch,
+    queueMeshLoDGpuSelection,
+} from "../../mesh-lod/mesh-lod-selection-gpu.js";
 import type { MeshLoDShaderFeatures } from "./pbr-mesh-lod-compose.js";
 import { composeMeshLoDWgsl, meshLoDShaderKey } from "./pbr-mesh-lod-compose.js";
 
@@ -126,12 +137,25 @@ interface MeshLoDBatchPacket {
     readonly drawVertexBuffer: GPUBuffer;
     readonly instanceBuffer: GPUBuffer;
     readonly indirectBuffer: GPUBuffer;
+    readonly materialUbo: GPUBuffer;
+    readonly arena: GPUBuffer;
     readonly drawScratch: Uint32Array;
     readonly instanceScratch: Float32Array;
     readonly indirectScratch: Uint32Array;
     readonly maxDrawVertices: number;
     readonly maxInstances: number;
+    /** Per-instance coarse expanded-vertex bound, for GPU draw-vertex buffer sizing. */
+    readonly coarseVertices: number;
     lastVertexCount: number;
+    // ── GPU selection/expansion path (created lazily on first GPU-mode frame) ──
+    gpuInstanceState: MeshLoDGpuInstanceState | null;
+    gpuBatchState: MeshLoDGpuBatchState | null;
+    gpuBindGroup: GPUBindGroup | null;
+    gpuBoundDrawVertices: GPUBuffer | null;
+    gpuBoundInstances: GPUBuffer | null;
+    /** Per-frame resolved binding + indirect buffer the draw closure consumes. */
+    activeBindGroup: GPUBindGroup | null;
+    activeIndirectBuffer: GPUBuffer | null;
     dispose(): void;
 }
 
@@ -243,10 +267,10 @@ function writeInstanceRecord(out: Float32Array, floatOffset: number, world: Mat4
     out[floatOffset + 27] = 0;
 }
 
-/** Per-frame CPU selection + expansion: run the oracle for each visible instance,
- *  write its world/normal matrices, and flatten selected pinned clusters into the
- *  draw-vertex stream, then publish the single indirect vertex count. */
-function updatePacket(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, context: DrawUpdateContext): void {
+/** Per-frame CPU selection + expansion (reference/diagnostic mode): run the oracle for
+ *  each visible instance, write its world/normal matrices, and flatten selected pinned
+ *  clusters into the draw-vertex stream, then publish the single indirect vertex count. */
+function updatePacketCpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, context: DrawUpdateContext): void {
     const runtime = batch.asset._runtime;
     const selections = selectMeshLoDBatch(batch, context);
     const draw = packet.drawScratch;
@@ -300,10 +324,77 @@ function updatePacket(engine: EngineContext, batch: MeshLoDSceneBatch, packet: M
     packet.indirectScratch[3] = 0;
     engine._device.queue.writeBuffer(packet.indirectBuffer, 0, packet.indirectScratch.buffer, packet.indirectScratch.byteOffset, 16);
     packet.lastVertexCount = vertexCount;
+    packet.activeBindGroup = packet.bindGroup;
+    packet.activeIndirectBuffer = packet.indirectBuffer;
 
     const diag = runtime.diagnostics as { renderedTriangleCount: number; selectedMeshletCount: number };
     diag.renderedTriangleCount = vertexCount / 3;
     diag.selectedMeshletCount = selectedMeshlets;
+}
+
+function buildGpuFrame(batch: MeshLoDSceneBatch, camera: Camera, context: DrawUpdateContext): MeshLoDGpuFrameParams {
+    const runtime = batch.asset._runtime;
+    const pos = getCameraPosition(camera);
+    const v = camera.viewport;
+    const aspect = (context.targetWidth / context.targetHeight) * (v ? v.width / v.height : 1);
+    return {
+        cameraPos: [pos.x, pos.y, pos.z],
+        verticalFov: camera.fov,
+        near: camera.nearPlane,
+        targetWidth: context.targetWidth,
+        targetHeight: context.targetHeight,
+        viewProjection: getViewProjectionMatrix(camera, aspect),
+        frustumCull: true, // GPU render path culls; CPU diagnostic mode keeps every cluster
+        screenSpaceError: runtime.settings.screenSpaceError,
+        lodHysteresis: runtime.settings.lodHysteresis,
+        levelCount: runtime.header.levelCount,
+    };
+}
+
+/** Per-frame GPU selection + expansion (production mode): queue the compute work into
+ *  the shared MeshLoD update batch (flushed before the render pass) and resolve the
+ *  binding + indirect buffer the GPU-filled draw stream consumes. */
+function updatePacketGpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, context: DrawUpdateContext, updateBatch: MeshLoDUpdateBatch): void {
+    const camera = context._camera;
+    if (!camera || batch.instances.length === 0) {
+        packet.activeBindGroup = null;
+        packet.activeIndirectBuffer = null;
+        return;
+    }
+    const runtime = batch.asset._runtime;
+    packet.gpuInstanceState ??= createMeshLoDGpuInstanceState(runtime.groups.length);
+    packet.gpuBatchState ??= createMeshLoDGpuBatchState();
+    const handles = queueMeshLoDGpuSelection(
+        engine,
+        updateBatch,
+        runtime,
+        packet.gpuInstanceState,
+        packet.gpuBatchState,
+        batch.instances,
+        packet.coarseVertices,
+        buildGpuFrame(batch, camera, context)
+    );
+    if (!handles) {
+        packet.activeBindGroup = null;
+        packet.activeIndirectBuffer = null;
+        return;
+    }
+    if (!packet.gpuBindGroup || packet.gpuBoundDrawVertices !== handles.drawVertexBuffer || packet.gpuBoundInstances !== handles.instanceBuffer) {
+        packet.gpuBindGroup = buildBindGroup(engine, packet.bindGroupLayout, batch.material, handles.drawVertexBuffer, handles.instanceBuffer, packet.arena, packet.materialUbo);
+        packet.gpuBoundDrawVertices = handles.drawVertexBuffer;
+        packet.gpuBoundInstances = handles.instanceBuffer;
+    }
+    packet.activeBindGroup = packet.gpuBindGroup;
+    packet.activeIndirectBuffer = handles.drawArgsBuffer;
+}
+
+/** Dispatch the per-frame update to the CPU reference or GPU production path. */
+function updatePacket(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, context: DrawUpdateContext, updateBatch: MeshLoDUpdateBatch | undefined): void {
+    if (updateBatch && batch.asset._runtime.selectionMode === "gpu") {
+        updatePacketGpu(engine, batch, packet, context, updateBatch);
+    } else {
+        updatePacketCpu(engine, batch, packet, context);
+    }
 }
 
 /** Build the single indirect-draw `Renderable` for one MeshLoD batch, or `null`
@@ -345,17 +436,33 @@ export function buildMeshLoDBatchRenderable(engine: EngineContext, _scene: Scene
         drawVertexBuffer,
         instanceBuffer,
         indirectBuffer,
+        materialUbo,
+        arena: runtime.gpu.arena.buffer,
         drawScratch: new Uint32Array(maxDrawVertices * 4),
         instanceScratch: new Float32Array(maxInstances * (INSTANCE_STRIDE / 4)),
         indirectScratch: new Uint32Array(4),
         maxDrawVertices,
         maxInstances,
+        coarseVertices,
         lastVertexCount: 0,
+        gpuInstanceState: null,
+        gpuBatchState: null,
+        gpuBindGroup: null,
+        gpuBoundDrawVertices: null,
+        gpuBoundInstances: null,
+        activeBindGroup: null,
+        activeIndirectBuffer: null,
         dispose: () => {
             materialUbo.destroy();
             drawVertexBuffer.destroy();
             instanceBuffer.destroy();
             indirectBuffer.destroy();
+            if (packet.gpuInstanceState) {
+                disposeMeshLoDGpuInstanceState(packet.gpuInstanceState);
+            }
+            if (packet.gpuBatchState) {
+                disposeMeshLoDGpuBatchState(packet.gpuBatchState);
+            }
         },
     };
     (batch as { _packet?: unknown })._packet = packet;
@@ -365,15 +472,20 @@ export function buildMeshLoDBatchRenderable(engine: EngineContext, _scene: Scene
         isTransparent: false,
         bind(eng: EngineContext, sig: RenderTargetSignature): DrawBinding {
             const pipeline = getPipeline(eng, packet, sig);
+            const updateBatch = batch.asset._runtime.selectionMode === "gpu" ? getMeshLoDUpdateBatch(sig) : undefined;
             return {
                 renderable,
                 pipeline,
-                update: (context: DrawUpdateContext) => updatePacket(eng, batch, packet, context),
+                update: (context: DrawUpdateContext) => updatePacket(eng, batch, packet, context, updateBatch),
                 draw: (pass: GPURenderPassEncoder | GPURenderBundleEncoder): number => {
-                    pass.setBindGroup(1, packet.bindGroup);
-                    pass.drawIndirect(packet.indirectBuffer, 0);
+                    if (!packet.activeBindGroup || !packet.activeIndirectBuffer) {
+                        return 0;
+                    }
+                    pass.setBindGroup(1, packet.activeBindGroup);
+                    pass.drawIndirect(packet.activeIndirectBuffer, 0);
                     return 1;
                 },
+                _updateBatches: updateBatch ? [updateBatch] : undefined,
             };
         },
     };

@@ -1,10 +1,11 @@
-/** MeshLoD coarse indirect-render integration tests (Task 4.4).
+/** MeshLoD coarse indirect-render integration tests (Task 4.4; CPU reference path).
  *
  *  Drive the full public load → instance → register → build → select → expand →
- *  draw path against a mock device + fill decoder (no browser). Assert coarse-only
- *  expansion of the pinned terminal clusters, a single `drawIndirect` per batch
- *  regardless of meshlet/instance count, and the material-owned unsupported-state
- *  rejection. Real WebGPU pixels are validated separately in the browser. */
+ *  draw path against a mock device + fill decoder (no browser) in CPU selection mode
+ *  (the deterministic reference/diagnostic path). Assert coarse-only expansion of the
+ *  pinned terminal clusters, a single `drawIndirect` per batch regardless of
+ *  meshlet/instance count, and the material-owned unsupported-state rejection. The GPU
+ *  production path is covered by mesh-lod-indirect-render.spec + browser validation. */
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -82,7 +83,7 @@ afterEach(() => {
 
 describe("MeshLoD coarse indirect rendering", () => {
     it("expands the pinned terminal clusters and issues exactly one indirect draw per batch", async () => {
-        const asset = await loadMeshLoD(engine, statueSource());
+        const asset = await loadMeshLoD(engine, statueSource(), { selectionMode: "cpu" });
         const material: PbrMaterialProps = { doubleSided: true } as PbrMaterialProps;
         const scene = await buildScene(asset, engine, material, 1);
 
@@ -103,7 +104,7 @@ describe("MeshLoD coarse indirect rendering", () => {
     });
 
     it("keeps one draw per batch while the expanded meshlet count grows with instances", async () => {
-        const asset = await loadMeshLoD(engine, statueSource());
+        const asset = await loadMeshLoD(engine, statueSource(), { selectionMode: "cpu" });
         const material: PbrMaterialProps = {} as PbrMaterialProps;
         const scene = await buildScene(asset, engine, material, 3);
 
@@ -120,7 +121,7 @@ describe("MeshLoD coarse indirect rendering", () => {
     });
 
     it("survives unavailable fine data by rendering the coarse fallback", async () => {
-        const asset = await loadMeshLoD(engine, statueSource());
+        const asset = await loadMeshLoD(engine, statueSource(), { selectionMode: "cpu" });
         // No fine pages are resident (Phase 4). Selection must still produce coarse output.
         const scene = await buildScene(asset, engine, {} as PbrMaterialProps, 1);
         scene._renderables[0]!.bind(engine, SIG).update!(CONTEXT);
@@ -129,7 +130,7 @@ describe("MeshLoD coarse indirect rendering", () => {
     });
 
     it("rejects an unsupported material through the PBR module (MLOD_UNSUPPORTED_MATERIAL)", async () => {
-        const asset = await loadMeshLoD(engine, statueSource());
+        const asset = await loadMeshLoD(engine, statueSource(), { selectionMode: "cpu" });
         const scene = fakeScene(engine);
         const material = { clearCoat: { isEnabled: true } } as unknown as PbrMaterialProps;
         const instance = createMeshLoDInstance(asset, {} as PbrMaterialProps);
@@ -143,7 +144,7 @@ describe("MeshLoD coarse indirect rendering", () => {
     });
 
     it("detects base/normal/ORM/emissive/double-sided/unlit variants", async () => {
-        const asset = await loadMeshLoD(engine, statueSource());
+        const asset = await loadMeshLoD(engine, statueSource(), { selectionMode: "cpu" });
         for (const material of [{} as PbrMaterialProps, { doubleSided: true } as PbrMaterialProps, { unlit: true } as PbrMaterialProps]) {
             const scene = await buildScene(asset, engine, material, 1);
             expect(scene._renderables).toHaveLength(1);

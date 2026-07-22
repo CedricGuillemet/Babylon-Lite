@@ -39,6 +39,8 @@ export const PAGE_STATE_WORDS = 8;
 /** 128-byte / 32-word instance record. */
 export const INSTANCE_BYTES = 128;
 export const INSTANCE_WORDS = INSTANCE_BYTES / 4;
+/** 24-byte packed vertex (position f32x3, oct-normal, half-UV, reserved) → 6 words. */
+export const VERTEX_WORDS = 6;
 
 /** Page-state flag bits (word 0). */
 export const PAGE_FLAG_RESIDENT = 0x1;
@@ -507,6 +509,68 @@ export function runMeshLoDGpuSelection(input: MeshLoDGpuSelectionModelInput): Me
     };
 }
 
+/** Packed inputs to the GPU expansion model — the buffers the expandClusters kernel
+ *  reads. */
+export interface MeshLoDGpuExpansionInput {
+    readonly selected: readonly MeshLoDGpuSelectedPair[];
+    readonly clusters: Uint32Array;
+    readonly clusterWordOffset?: number;
+    readonly pageState: Uint32Array;
+    /** Decoded geometry arena words (vertex + index blocks per page). */
+    readonly arena: Uint32Array;
+    readonly drawVertexCapacity: number;
+}
+
+export interface MeshLoDGpuExpansionResult {
+    /** 4 words per expanded vertex: arena vertex-word offset, cluster ID, slot, flags. */
+    readonly drawVertices: Uint32Array;
+    readonly vertexCount: number;
+    readonly overflow: boolean;
+}
+
+function readArenaU16(arena: Uint32Array, byteOffset: number): number {
+    const word = arena[byteOffset >>> 2]!;
+    const shift = (byteOffset & 2) * 8;
+    return (word >>> shift) & 0xffff;
+}
+
+/** Run the deterministic GPU expansion model — the exact TS mirror of the WGSL
+ *  `expandClusters` kernel over the same packed buffers. Expands each selected cluster
+ *  in order into absolute arena vertex-word offsets + IDs, bounded by capacity. Used by
+ *  Node fixtures to prove exact expanded records; the WGSL is browser-validated. */
+export function runMeshLoDGpuExpansion(input: MeshLoDGpuExpansionInput): MeshLoDGpuExpansionResult {
+    const cwo = input.clusterWordOffset ?? 0;
+    const cap = input.drawVertexCapacity;
+    const draw = new Uint32Array(Math.max(cap, 0) * 4);
+    let vertexCount = 0;
+    let overflow = false;
+    for (const { clusterId, instanceId } of input.selected) {
+        const cBase = cwo + clusterId * CLUSTER_WORDS;
+        const pageId = input.clusters[cBase + 7]!;
+        const clusterIndexOffset = input.clusters[cBase + 9]!;
+        const indexCount = input.clusters[cBase + 11]! * 3;
+        const psBase = pageId * PAGE_STATE_WORDS;
+        const arenaVertexWord = input.pageState[psBase + 2]! >>> 2;
+        const arenaIndexByte = input.pageState[psBase + 3]!;
+        const base = vertexCount;
+        for (let k = 0; k < indexCount; k++) {
+            const dst = base + k;
+            if (dst >= cap) {
+                overflow = true;
+                continue;
+            }
+            const localVertex = readArenaU16(input.arena, arenaIndexByte + (clusterIndexOffset + k) * 2);
+            const o = dst * 4;
+            draw[o] = arenaVertexWord + localVertex * VERTEX_WORDS;
+            draw[o + 1] = clusterId;
+            draw[o + 2] = instanceId;
+            draw[o + 3] = 0;
+        }
+        vertexCount += indexCount;
+    }
+    return { drawVertices: draw, vertexCount: Math.min(vertexCount, cap), overflow };
+}
+
 // ─── Device-limit-checked storage buffers ────────────────────────────
 
 function checkedStorageBuffer(engine: EngineContext, byteLength: number, label: string, extraUsage = 0): GPUBuffer {
@@ -815,13 +879,20 @@ interface MeshLoDSelectionPipelines {
     readonly evaluate: GPUComputePipeline;
     readonly select: GPUComputePipeline;
     readonly demand: GPUComputePipeline;
+    readonly clamp: GPUComputePipeline;
+    readonly expandLayout: GPUBindGroupLayout;
+    readonly expand: GPUComputePipeline;
+    readonly finalize: GPUComputePipeline;
     readonly module: GPUShaderModule;
 }
 
 let _pipelines: MeshLoDSelectionPipelines | null = null;
 
-/** Build (once per device) the four selection compute pipelines over one explicit
- *  bind-group layout shared by every entry point. */
+/** Build (once per device) the selection + expansion compute pipelines. The five
+ *  selection-pass kernels share one explicit bind-group layout (bindings 0-7);
+ *  expansion uses its own layout (bindings 0,1,2,6,8,9,10 — no `control`, the indirect-
+ *  dispatch source) so each stage stays within the 8-storage-buffer limit and no buffer
+ *  is both writable storage and indirect in one synchronization scope. */
 export function getMeshLoDSelectionPipelines(engine: EngineContext): MeshLoDSelectionPipelines {
     if (_pipelines && _pipelines.device === engine._device) {
         return _pipelines;
@@ -842,19 +913,36 @@ export function getMeshLoDSelectionPipelines(engine: EngineContext): MeshLoDSele
             buf(7, "storage"),
         ],
     });
+    const expandLayout = device.createBindGroupLayout({
+        label: "mesh-lod-expand",
+        entries: [
+            buf(0, "uniform"),
+            buf(1, "read-only-storage"),
+            buf(2, "read-only-storage"),
+            buf(6, "storage"),
+            buf(8, "read-only-storage"),
+            buf(9, "storage"),
+            buf(10, "storage"),
+        ],
+    });
     const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+    const expandPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [expandLayout] });
     const module = device.createShaderModule({ label: "mesh-lod-selection", code: selectionWgsl });
-    const pipe = (entryPoint: string): GPUComputePipeline =>
-        device.createComputePipeline({ label: `mesh-lod-${entryPoint}`, layout: pipelineLayout, compute: { module, entryPoint } });
+    const pipe = (pl: GPUPipelineLayout, entryPoint: string): GPUComputePipeline =>
+        device.createComputePipeline({ label: `mesh-lod-${entryPoint}`, layout: pl, compute: { module, entryPoint } });
     _pipelines = {
         device,
         layout,
         pipelineLayout,
         module,
-        traverse: pipe("traverse"),
-        evaluate: pipe("evaluateGroups"),
-        select: pipe("selectClusters"),
-        demand: pipe("computeDemand"),
+        traverse: pipe(pipelineLayout, "traverse"),
+        evaluate: pipe(pipelineLayout, "evaluateGroups"),
+        select: pipe(pipelineLayout, "selectClusters"),
+        demand: pipe(pipelineLayout, "computeDemand"),
+        clamp: pipe(pipelineLayout, "clampSelectedCount"),
+        expandLayout,
+        expand: pipe(expandPipelineLayout, "expandClusters"),
+        finalize: pipe(expandPipelineLayout, "finalizeDraw"),
     };
     return _pipelines;
 }
@@ -883,6 +971,14 @@ export interface MeshLoDGpuBatchState {
     boundPageState: GPUBuffer | null;
     boundInstances: GPUBuffer | null;
     boundPrior: GPUBuffer | null;
+    // ── Task 5.3 expansion + indirect draw ──
+    drawVertexBuffer: GPUBuffer | null;
+    drawArgsBuffer: GPUBuffer | null;
+    expandBindGroup: GPUBindGroup | null;
+    drawVertexCapacity: number;
+    /** Per-instance draw-vertex bound (coarse expanded vertices) the buffer is sized from. */
+    drawVertexBound: number;
+    boundArena: GPUBuffer | null;
 }
 
 /** Create empty per-batch transient selection state. */
@@ -909,24 +1005,39 @@ export function createMeshLoDGpuBatchState(): MeshLoDGpuBatchState {
         boundPageState: null,
         boundInstances: null,
         boundPrior: null,
+        drawVertexBuffer: null,
+        drawArgsBuffer: null,
+        expandBindGroup: null,
+        drawVertexCapacity: 0,
+        drawVertexBound: 0,
+        boundArena: null,
     };
 }
 
 /** Size the transient buffers for `instanceCapacity` instances of the asset. The
  *  group-state and selected-list scale with instance capacity; growth retires the old
  *  buffers after the next frame drains and invalidates the bind group. */
-function ensureMeshLoDBatchBuffers(engine: EngineContext, state: MeshLoDGpuBatchState, instanceCapacity: number, assetBuffers: MeshLoDGpuAssetBuffers): void {
+function ensureMeshLoDBatchBuffers(
+    engine: EngineContext,
+    state: MeshLoDGpuBatchState,
+    instanceCapacity: number,
+    drawVertexBound: number,
+    assetBuffers: MeshLoDGpuAssetBuffers
+): void {
     const device = engine._device;
     if (state.device !== device) {
         state.groupStateBuffer = state.selectedBuffer = state.controlBuffer = state.paramsBuffer = null;
-        state.bindGroup = null;
+        state.drawVertexBuffer = state.drawArgsBuffer = null;
+        state.bindGroup = state.expandBindGroup = null;
         state.instanceCapacity = 0;
+        state.drawVertexCapacity = 0;
         state.device = device;
     }
     state.groupCount = assetBuffers.groupCount;
     state.clusterCount = assetBuffers.clusterCount;
     state.nodeCount = assetBuffers.nodeCount;
     state.pageCount = assetBuffers.pageCount;
+    state.drawVertexBound = drawVertexBound;
     const controlWords = CONTROL_PAGE_DEMAND_OFFSET + Math.max(assetBuffers.pageCount, 1);
     if (!state.controlBuffer) {
         state.controlBuffer = device.createBuffer({ label: "mesh-lod-control", size: controlWords * 4, usage: BU.STORAGE | BU.INDIRECT | BU.COPY_DST | BU.COPY_SRC });
@@ -935,11 +1046,20 @@ function ensureMeshLoDBatchBuffers(engine: EngineContext, state: MeshLoDGpuBatch
         device.queue.writeBuffer(state.controlBuffer, 4, Uint32Array.from([1, 1]).buffer);
         state.bindGroup = null;
     }
+    if (!state.drawArgsBuffer) {
+        // 5 words: vertexCount, instanceCount, firstVertex, firstInstance, expansion-overflow.
+        state.drawArgsBuffer = device.createBuffer({ label: "mesh-lod-draw-args", size: 20, usage: BU.INDIRECT | BU.STORAGE | BU.COPY_DST });
+        device.queue.writeBuffer(state.drawArgsBuffer, 8, Uint32Array.from([0, 0, 0]).buffer); // firstVertex/firstInstance/overflow = 0
+        state.expandBindGroup = null;
+    }
     if (!state.paramsBuffer) {
         state.paramsBuffer = device.createBuffer({ label: "mesh-lod-params", size: PARAMS_ALLOC, usage: BU.UNIFORM | BU.COPY_DST });
-        state.bindGroup = null;
+        state.bindGroup = state.expandBindGroup = null;
     }
-    if (instanceCapacity <= state.instanceCapacity && state.groupStateBuffer && state.selectedBuffer) {
+    const drawVertexCapacity = Math.max(drawVertexBound * Math.max(instanceCapacity, 1), 3);
+    const growInstances = instanceCapacity > state.instanceCapacity || !state.groupStateBuffer || !state.selectedBuffer;
+    const growDraw = drawVertexCapacity > state.drawVertexCapacity || !state.drawVertexBuffer;
+    if (!growInstances && !growDraw) {
         return;
     }
     let capacity = Math.max(state.instanceCapacity, 1);
@@ -948,16 +1068,30 @@ function ensureMeshLoDBatchBuffers(engine: EngineContext, state: MeshLoDGpuBatch
     }
     const oldGroupState = state.groupStateBuffer;
     const oldSelected = state.selectedBuffer;
-    const selectedCapacity = Math.max(assetBuffers.clusterCount * capacity, 1);
-    state.groupStateBuffer = device.createBuffer({ label: "mesh-lod-group-state", size: Math.max(capacity * assetBuffers.groupCount, 1) * 4, usage: BU.STORAGE | BU.COPY_DST });
-    state.selectedBuffer = device.createBuffer({ label: "mesh-lod-selected", size: selectedCapacity * 2 * 4, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC });
-    state.instanceCapacity = capacity;
-    state.selectedCapacity = selectedCapacity;
-    state.bindGroup = null;
-    if (oldGroupState || oldSelected) {
+    const oldDrawVertex = state.drawVertexBuffer;
+    if (growInstances) {
+        const selectedCapacity = Math.max(assetBuffers.clusterCount * capacity, 1);
+        state.groupStateBuffer = device.createBuffer({ label: "mesh-lod-group-state", size: Math.max(capacity * assetBuffers.groupCount, 1) * 4, usage: BU.STORAGE | BU.COPY_DST });
+        state.selectedBuffer = device.createBuffer({ label: "mesh-lod-selected", size: selectedCapacity * 2 * 4, usage: BU.STORAGE | BU.COPY_DST | BU.COPY_SRC });
+        state.instanceCapacity = capacity;
+        state.selectedCapacity = selectedCapacity;
+        state.bindGroup = null;
+        state.expandBindGroup = null;
+    }
+    if (growDraw) {
+        state.drawVertexBuffer = device.createBuffer({ label: "mesh-lod-draw-vertices", size: drawVertexCapacity * 16, usage: BU.STORAGE | BU.COPY_DST });
+        state.drawVertexCapacity = drawVertexCapacity;
+        state.expandBindGroup = null;
+    }
+    if (oldGroupState || oldSelected || oldDrawVertex) {
         retireGpuResources(engine, () => {
-            oldGroupState?.destroy();
-            oldSelected?.destroy();
+            if (growInstances) {
+                oldGroupState?.destroy();
+                oldSelected?.destroy();
+            }
+            if (growDraw) {
+                oldDrawVertex?.destroy();
+            }
         });
     }
 }
@@ -967,16 +1101,19 @@ function ensureMeshLoDBindGroup(
     state: MeshLoDGpuBatchState,
     pipelines: MeshLoDSelectionPipelines,
     assetBuffers: MeshLoDGpuAssetBuffers,
-    instanceState: MeshLoDGpuInstanceState
+    instanceState: MeshLoDGpuInstanceState,
+    arena: GPUBuffer
 ): void {
     const instances = instanceState.instanceBuffer!;
     const prior = instanceState.priorStateBuffer!;
     if (
         state.bindGroup &&
+        state.expandBindGroup &&
         state.boundMeta === assetBuffers.metaBuffer &&
         state.boundPageState === assetBuffers.pageStateBuffer &&
         state.boundInstances === instances &&
-        state.boundPrior === prior
+        state.boundPrior === prior &&
+        state.boundArena === arena
     ) {
         return;
     }
@@ -994,10 +1131,24 @@ function ensureMeshLoDBindGroup(
             { binding: 7, resource: { buffer: state.controlBuffer! } },
         ],
     });
+    state.expandBindGroup = engine._device.createBindGroup({
+        label: "mesh-lod-expand",
+        layout: pipelines.expandLayout,
+        entries: [
+            { binding: 0, resource: { buffer: state.paramsBuffer! } },
+            { binding: 1, resource: { buffer: assetBuffers.metaBuffer } },
+            { binding: 2, resource: { buffer: assetBuffers.pageStateBuffer } },
+            { binding: 6, resource: { buffer: state.selectedBuffer! } },
+            { binding: 8, resource: { buffer: arena } },
+            { binding: 9, resource: { buffer: state.drawVertexBuffer! } },
+            { binding: 10, resource: { buffer: state.drawArgsBuffer! } },
+        ],
+    });
     state.boundMeta = assetBuffers.metaBuffer;
     state.boundPageState = assetBuffers.pageStateBuffer;
     state.boundInstances = instances;
     state.boundPrior = prior;
+    state.boundArena = arena;
 }
 
 /** Destroy the per-batch transient selection buffers. Idempotent-safe. */
@@ -1006,9 +1157,13 @@ export function disposeMeshLoDGpuBatchState(state: MeshLoDGpuBatchState): void {
     state.selectedBuffer?.destroy();
     state.controlBuffer?.destroy();
     state.paramsBuffer?.destroy();
+    state.drawVertexBuffer?.destroy();
+    state.drawArgsBuffer?.destroy();
     state.groupStateBuffer = state.selectedBuffer = state.controlBuffer = state.paramsBuffer = null;
-    state.bindGroup = null;
+    state.drawVertexBuffer = state.drawArgsBuffer = null;
+    state.bindGroup = state.expandBindGroup = null;
     state.instanceCapacity = 0;
+    state.drawVertexCapacity = 0;
 }
 
 /** Camera + selection inputs for one frame's GPU selection, produced by the scene from
@@ -1072,7 +1227,7 @@ function writeSelectionParams(
     u[47] = assetBuffers.pageRefWordOffset;
     u[48] = CONTROL_DIAG_OFFSET;
     u[49] = CONTROL_PAGE_DEMAND_OFFSET;
-    u[50] = 0;
+    u[50] = state.drawVertexCapacity; // params.control.z — expansion draw-vertex capacity
     u[51] = 0;
 }
 
@@ -1093,12 +1248,33 @@ interface MeshLoDBufferClear {
 
 interface MeshLoDSelectionJob {
     readonly clears: MeshLoDBufferClear[];
-    readonly steps: MeshLoDComputeStep[];
+    /** Selection pass (traverse→evaluate→select→demand→clamp). */
+    readonly pass1Steps: MeshLoDComputeStep[];
+    /** Expansion pass (expandClusters indirect → finalizeDraw). Separated from pass 1
+     *  so `control` is never writable storage and indirect in one synchronization scope. */
+    readonly pass2Steps: MeshLoDComputeStep[];
 }
 
-/** @internal Feature-owned update batch: collects every MeshLoD batch's selection
- *  (and, from Task 5.3, expansion) work and submits it as one compute pass flushed
- *  before the render pass (architecture §12.3). One per render-target signature. */
+function replaySteps(pass: GPUComputePassEncoder, steps: readonly MeshLoDComputeStep[]): void {
+    let lastPipeline: GPUComputePipeline | null = null;
+    for (const step of steps) {
+        if (step.pipeline !== lastPipeline) {
+            pass.setPipeline(step.pipeline);
+            lastPipeline = step.pipeline;
+        }
+        pass.setBindGroup(0, step.bindGroup);
+        if (step.indirectBuffer) {
+            pass.dispatchWorkgroupsIndirect(step.indirectBuffer, step.indirectOffset ?? 0);
+        } else {
+            pass.dispatchWorkgroups(step.workgroups ?? 0);
+        }
+    }
+}
+
+/** @internal Feature-owned update batch: collects every MeshLoD batch's selection and
+ *  expansion work and submits it as two compute passes (selection, then indirect
+ *  expansion) flushed before the render pass (architecture §12.3). One per render-target
+ *  signature. */
 export interface MeshLoDUpdateBatch extends DrawUpdateBatch {
     queue(job: MeshLoDSelectionJob): void;
 }
@@ -1128,23 +1304,18 @@ export function getMeshLoDUpdateBatch(signature: RenderTargetSignature): MeshLoD
                     encoder.clearBuffer(clear.buffer, clear.offset, clear.size);
                 }
             }
-            const pass = encoder.beginComputePass();
-            let lastPipeline: GPUComputePipeline | null = null;
+            // Pass 1: selection (writes control as storage). Pass 2: indirect expansion
+            // (reads control as the dispatch source) — a separate synchronization scope.
+            const selectionPass = encoder.beginComputePass();
             for (let i = 0; i < count; i++) {
-                for (const step of jobs[i]!.steps) {
-                    if (step.pipeline !== lastPipeline) {
-                        pass.setPipeline(step.pipeline);
-                        lastPipeline = step.pipeline;
-                    }
-                    pass.setBindGroup(0, step.bindGroup);
-                    if (step.indirectBuffer) {
-                        pass.dispatchWorkgroupsIndirect(step.indirectBuffer, step.indirectOffset ?? 0);
-                    } else {
-                        pass.dispatchWorkgroups(step.workgroups ?? 0);
-                    }
-                }
+                replaySteps(selectionPass, jobs[i]!.pass1Steps);
             }
-            pass.end();
+            selectionPass.end();
+            const expandPass = encoder.beginComputePass();
+            for (let i = 0; i < count; i++) {
+                replaySteps(expandPass, jobs[i]!.pass2Steps);
+            }
+            expandPass.end();
         },
         destroy(): void {
             jobs.length = 0;
@@ -1159,20 +1330,24 @@ export function getMeshLoDUpdateBatch(signature: RenderTargetSignature): MeshLoD
     return batch;
 }
 
-/** Result handed to the render binding after selection is queued: the buffers the
- *  expansion (Task 5.3) and indirect draw consume. */
+/** Result handed to the render binding after selection + expansion are queued: the
+ *  buffers the indirect draw consumes. */
 export interface MeshLoDGpuSelectionHandles {
     readonly controlBuffer: GPUBuffer;
     readonly selectedBuffer: GPUBuffer;
-    readonly bindGroup: GPUBindGroup;
+    readonly drawVertexBuffer: GPUBuffer;
+    readonly drawArgsBuffer: GPUBuffer;
+    readonly instanceBuffer: GPUBuffer;
     readonly selectedCapacity: number;
     readonly instanceCount: number;
 }
 
-/** Prepare and queue one batch's GPU selection into the shared compute pass: sync page
- *  state, version-gate instance uploads, size transient buffers, write params, reset
- *  transient counters, and append the traverse→evaluate→select→demand steps. Returns
- *  the buffers the expansion + indirect draw consume, or `null` for an empty batch. */
+/** Prepare and queue one batch's GPU selection + expansion into the shared compute
+ *  pass: sync page state, version-gate instance uploads, size transient buffers, write
+ *  params, reset transient counters, and append traverse→evaluate→select→demand then
+ *  the indirect expandClusters + finalizeDraw. `drawVertexBound` is the per-instance
+ *  expanded-vertex bound the draw-vertex buffer is sized from. Returns the buffers the
+ *  indirect draw consumes, or `null` for an empty batch. */
 export function queueMeshLoDGpuSelection(
     engine: EngineContext,
     updateBatch: MeshLoDUpdateBatch,
@@ -1180,6 +1355,7 @@ export function queueMeshLoDGpuSelection(
     instanceState: MeshLoDGpuInstanceState,
     batchState: MeshLoDGpuBatchState,
     instances: readonly MeshLoDGpuInstanceInput[],
+    drawVertexBound: number,
     frame: MeshLoDGpuFrameParams
 ): MeshLoDGpuSelectionHandles | null {
     if (instances.length === 0) {
@@ -1189,12 +1365,13 @@ export function queueMeshLoDGpuSelection(
     const assetBuffers = getMeshLoDGpuAssetBuffers(engine, runtime);
     const instanceCount = uploadMeshLoDInstances(engine, instanceState, instances);
     syncMeshLoDPageState(engine, assetBuffers, runtime);
-    ensureMeshLoDBatchBuffers(engine, batchState, instanceState.capacity, assetBuffers);
-    ensureMeshLoDBindGroup(engine, batchState, pipelines, assetBuffers, instanceState);
+    ensureMeshLoDBatchBuffers(engine, batchState, instanceState.capacity, drawVertexBound, assetBuffers);
+    ensureMeshLoDBindGroup(engine, batchState, pipelines, assetBuffers, instanceState, runtime.gpu.arena.buffer);
     writeSelectionParams(batchState, assetBuffers, instanceCount, instanceState.wordsPerInstance, frame);
     engine._device.queue.writeBuffer(batchState.paramsBuffer!, 0, batchState.paramsBytes, 0, PARAMS_BYTES);
 
     const bindGroup = batchState.bindGroup!;
+    const expandBindGroup = batchState.expandBindGroup!;
     const groupInvocations = Math.ceil((batchState.groupCount * instanceCount) / SELECTION_WORKGROUP);
     const nodeInvocations = Math.ceil((batchState.nodeCount * instanceCount) / SELECTION_WORKGROUP);
     const clusterInvocations = Math.ceil((batchState.clusterCount * instanceCount) / SELECTION_WORKGROUP);
@@ -1204,12 +1381,21 @@ export function queueMeshLoDGpuSelection(
             { buffer: batchState.controlBuffer!, offset: CONTROL_COUNT_WORD * 4, size: 4 },
             { buffer: batchState.controlBuffer!, offset: CONTROL_DIAG_OFFSET * 4, size: (CONTROL_DIAG_WORDS + Math.max(batchState.pageCount, 1)) * 4 },
             { buffer: batchState.groupStateBuffer!, offset: 0, size: Math.max(batchState.groupCount * instanceCount, 1) * 4 },
+            { buffer: batchState.drawArgsBuffer!, offset: 0, size: 4 }, // vertexCount = 0
+            { buffer: batchState.drawArgsBuffer!, offset: 16, size: 4 }, // expansion overflow = 0
         ],
-        steps: [
+        pass1Steps: [
             { pipeline: pipelines.traverse, bindGroup, workgroups: nodeInvocations },
             { pipeline: pipelines.evaluate, bindGroup, workgroups: groupInvocations },
             { pipeline: pipelines.select, bindGroup, workgroups: clusterInvocations },
             { pipeline: pipelines.demand, bindGroup, workgroups: groupInvocations },
+            // Clamp the selected count so the expansion pass's indirect dispatch stays within capacity.
+            { pipeline: pipelines.clamp, bindGroup, workgroups: 1 },
+        ],
+        pass2Steps: [
+            // One workgroup per selected cluster via the clamped count in control[0..2].
+            { pipeline: pipelines.expand, bindGroup: expandBindGroup, indirectBuffer: batchState.controlBuffer!, indirectOffset: 0 },
+            { pipeline: pipelines.finalize, bindGroup: expandBindGroup, workgroups: 1 },
         ],
     };
     updateBatch.queue(job);
@@ -1217,7 +1403,9 @@ export function queueMeshLoDGpuSelection(
     return {
         controlBuffer: batchState.controlBuffer!,
         selectedBuffer: batchState.selectedBuffer!,
-        bindGroup,
+        drawVertexBuffer: batchState.drawVertexBuffer!,
+        drawArgsBuffer: batchState.drawArgsBuffer!,
+        instanceBuffer: instanceState.instanceBuffer!,
         selectedCapacity: batchState.selectedCapacity,
         instanceCount,
     };

@@ -5,7 +5,7 @@
 // module provides the ordered dispatches: traverse -> evaluateGroups ->
 // selectClusters -> computeDemand -> (Task 5.3) expandClusters. Workgroup size 64.
 //
-// One immutable "meta" buffer concatenates nodes ++ groups ++ clusters ++ pageRefs
+// One immutable "metaBuf" buffer concatenates nodes ++ groups ++ clusters ++ pageRefs
 // (word offsets in params) to stay within the 8-storage-buffer limit; a single u32
 // per (group,instance) "groupState" carries visible/fine/resident/demanded bits, and
 // one "control" buffer holds the indirect dispatch count, diagnostics, and per-page
@@ -23,7 +23,7 @@ struct Params {
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var<storage, read> meta: array<u32>;
+@group(0) @binding(1) var<storage, read> metaBuf: array<u32>;
 @group(0) @binding(2) var<storage, read> pageState: array<u32>;
 @group(0) @binding(3) var<storage, read> instances: array<f32>;
 @group(0) @binding(4) var<storage, read_write> priorState: array<atomic<u32>>;
@@ -45,7 +45,7 @@ const GS_DEMANDED: u32 = 0x8u;
 const PAGE_FLAG_RESIDENT: u32 = 0x1u;
 const FIXED_SCALE: f32 = 256.0; // fixed-point scale for atomic priority accumulation
 
-fn metaF32(i: u32) -> f32 { return bitcast<f32>(meta[i]); }
+fn metaF32(i: u32) -> f32 { return bitcast<f32>(metaBuf[i]); }
 
 fn groupStateIndex(inst: u32, group: u32) -> u32 { return inst * params.counts.y + group; }
 fn priorIndex(inst: u32, group: u32) -> u32 { return inst * params.layout0.x + (group >> 5u); }
@@ -97,7 +97,7 @@ fn pageResident(pageId: u32) -> bool {
 fn groupPagesResident(firstPageRef: u32, pageRefCount: u32) -> bool {
   let refBase = params.offsets.w;
   for (var i = 0u; i < pageRefCount; i = i + 1u) {
-    if (!pageResident(meta[refBase + firstPageRef + i])) { return false; }
+    if (!pageResident(metaBuf[refBase + firstPageRef + i])) { return false; }
   }
   return true;
 }
@@ -114,7 +114,7 @@ fn traverse(@builtin(global_invocation_id) gid: vec3<u32>) {
   let iBase = inst * INSTANCE_WORDS;
   if (bitcast<u32>(instances[iBase + 29u]) == 0u) { return; } // invisible
   let nBase = params.offsets.x + node * NODE_WORDS;
-  let groupId = i32(meta[nBase + 5u]);
+  let groupId = i32(metaBuf[nBase + 5u]);
   if (groupId < 0) { return; } // internal node
   let center = vec3<f32>(metaF32(nBase), metaF32(nBase + 1u), metaF32(nBase + 2u));
   let worldScale = instances[iBase + 28u];
@@ -137,10 +137,10 @@ fn evaluateGroups(@builtin(global_invocation_id) gid: vec3<u32>) {
   let gBase = params.offsets.y + group * GROUP_WORDS;
   let gsIdx = groupStateIndex(inst, group);
 
-  let resident = groupPagesResident(meta[gBase + 8u], meta[gBase + 9u]);
+  let resident = groupPagesResident(metaBuf[gBase + 8u], metaBuf[gBase + 9u]);
   if (resident) { atomicOr(&groupState[gsIdx], GS_RESIDENT); }
 
-  let terminal = (meta[gBase + 10u] & 0x1u) != 0u;
+  let terminal = (metaBuf[gBase + 10u] & 0x1u) != 0u;
   let simplifiedError = metaF32(gBase + 4u);
   var fine: bool;
   let pIdx = priorIndex(inst, group);
@@ -176,10 +176,10 @@ fn selectClusters(@builtin(global_invocation_id) gid: vec3<u32>) {
   let iBase = inst * INSTANCE_WORDS;
   if (bitcast<u32>(instances[iBase + 29u]) == 0u) { return; }
   let cBase = params.offsets.z + cluster * CLUSTER_WORDS;
-  let g = meta[cBase + 5u];
+  let g = metaBuf[cBase + 5u];
   let gs = atomicLoad(&groupState[groupStateIndex(inst, g)]);
   if ((gs & GS_VISIBLE) == 0u || (gs & GS_RESIDENT) == 0u || (gs & GS_FINE) == 0u) { return; }
-  let r = i32(meta[cBase + 6u]);
+  let r = i32(metaBuf[cBase + 6u]);
   if (r >= 0) {
     let rs = atomicLoad(&groupState[groupStateIndex(inst, u32(r))]);
     if ((rs & GS_FINE) != 0u && (rs & GS_RESIDENT) != 0u) { return; } // finer group draws instead
@@ -193,7 +193,7 @@ fn selectClusters(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (idx < params.layout0.y) {
     selectedList[idx * 2u] = cluster;
     selectedList[idx * 2u + 1u] = inst;
-    atomicAdd(&control[params.control.x + 1u], meta[cBase + 11u]); // renderedTriangleCount
+    atomicAdd(&control[params.control.x + 1u], metaBuf[cBase + 11u]); // renderedTriangleCount
   } else {
     atomicOr(&control[params.control.x + 2u], 1u); // overflow flag
   }
@@ -219,11 +219,11 @@ fn computeDemand(@builtin(global_invocation_id) gid: vec3<u32>) {
   let gsIdx = groupStateIndex(inst, group);
   if ((atomicLoad(&groupState[gsIdx]) & GS_DEMANDED) == 0u) { return; }
   let gBase = params.offsets.y + group * GROUP_WORDS;
-  let firstPageRef = meta[gBase + 8u];
-  let pageRefCount = meta[gBase + 9u];
+  let firstPageRef = metaBuf[gBase + 8u];
+  let pageRefCount = metaBuf[gBase + 9u];
   var missing = 0u;
   for (var i = 0u; i < pageRefCount; i = i + 1u) {
-    if (!pageResident(meta[params.offsets.w + firstPageRef + i])) { missing = missing + 1u; }
+    if (!pageResident(metaBuf[params.offsets.w + firstPageRef + i])) { missing = missing + 1u; }
   }
   if (missing == 0u) { return; }
   let center = vec3<f32>(metaF32(gBase), metaF32(gBase + 1u), metaF32(gBase + 2u));
@@ -236,10 +236,86 @@ fn computeDemand(@builtin(global_invocation_id) gid: vec3<u32>) {
   let pageShare = groupBenefit / f32(missing);
   let demandBase = params.control.y;
   for (var i = 0u; i < pageRefCount; i = i + 1u) {
-    let pageId = meta[params.offsets.w + firstPageRef + i];
+    let pageId = metaBuf[params.offsets.w + firstPageRef + i];
     if (!pageResident(pageId)) {
       atomicAdd(&control[demandBase + pageId], u32(pageShare * FIXED_SCALE));
     }
   }
   atomicAdd(&control[params.control.x + 3u], 1u); // fallbackGroupCount diag
 }
+
+// ── Task 5.3 clamp — 1 invocation. Runs at the end of the SELECTION pass so the
+//    expansion dispatch (a separate pass) reads a within-capacity indirect count.
+//    Splitting the passes is required: a buffer cannot be writable storage and an
+//    indirect-dispatch source in the same synchronization scope. ──
+@compute @workgroup_size(1)
+fn clampSelectedCount() {
+  let c = atomicLoad(&control[0]);
+  let cap = params.layout0.y;
+  if (c > cap) {
+    atomicStore(&control[0], cap);
+    atomicOr(&control[params.control.x + 2u], 1u); // selection overflow diag
+  }
+}
+
+// ── Task 5.3 expansion — its own bind-group layout {0,1,2,6,8,9,10} (no `control`,
+//    which is the indirect-dispatch source in this pass). One workgroup per selected
+//    cluster (the dispatch launches exactly the clamped selected count, so every
+//    workgroup is active) reserves triangleCount*3 draw vertices atomically, then all
+//    lanes decode packed u16 local indices in the geometry arena into absolute vertex-
+//    word offsets and 16-byte draw-vertex records. No vertex/index buffer is bound. ──
+@group(0) @binding(8) var<storage, read> arena: array<u32>;
+@group(0) @binding(9) var<storage, read_write> drawVertices: array<u32>;
+@group(0) @binding(10) var<storage, read_write> drawArgs: array<atomic<u32>>;
+
+const VERTEX_WORDS: u32 = 6u; // 24-byte packed vertex / 4
+
+var<workgroup> wgBase: u32;
+
+fn readLocalIndex(byteOffset: u32) -> u32 {
+  let word = arena[byteOffset >> 2u];
+  let shift = (byteOffset & 2u) * 8u;
+  return (word >> shift) & 0xffffu;
+}
+
+@compute @workgroup_size(64)
+fn expandClusters(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  let clusterId = selectedList[wid.x * 2u];
+  let slot = selectedList[wid.x * 2u + 1u];
+  let cBase = params.offsets.z + clusterId * CLUSTER_WORDS;
+  let pageId = metaBuf[cBase + 7u];
+  let clusterIndexOffset = metaBuf[cBase + 9u]; // first local index (u16 elements)
+  let indexCount = metaBuf[cBase + 11u] * 3u;
+  let psBase = pageId * PAGE_STATE_WORDS;
+  let arenaVertexWord = pageState[psBase + 2u] >> 2u; // absolute vertex byte -> word
+  let arenaIndexByte = pageState[psBase + 3u];
+  let drawCapacity = params.control.z;
+  if (lid.x == 0u) { wgBase = atomicAdd(&drawArgs[0], indexCount); }
+  workgroupBarrier();
+  let base = wgBase;
+  for (var k = lid.x; k < indexCount; k = k + 64u) {
+    let dst = base + k;
+    if (dst >= drawCapacity) { continue; } // capacity guard: never write OOB
+    let localVertex = readLocalIndex(arenaIndexByte + (clusterIndexOffset + k) * 2u);
+    let o = dst * 4u;
+    drawVertices[o] = arenaVertexWord + localVertex * VERTEX_WORDS;
+    drawVertices[o + 1u] = clusterId;
+    drawVertices[o + 2u] = slot;
+    drawVertices[o + 3u] = 0u; // debug/group flags — never affect selection or residency
+  }
+}
+
+// Finalize the indirect draw: clamp the draw-vertex count to capacity (expansion
+// overflow flagged in drawArgs word 4, not control, which is indirect-only here),
+// keep instanceCount = 1.
+@compute @workgroup_size(1)
+fn finalizeDraw() {
+  let cap = params.control.z;
+  let v = atomicLoad(&drawArgs[0]);
+  if (v > cap) {
+    atomicStore(&drawArgs[0], cap);
+    atomicStore(&drawArgs[4], 1u); // expansion overflow diag
+  }
+  atomicStore(&drawArgs[1], 1u); // instanceCount
+}
+

@@ -281,7 +281,7 @@ function fakeRuntime(h: FixtureHierarchy): MeshLoDAssetRuntime {
         pageRecords: h.pageStoredBytes.map(toPage),
         generation: 1,
         gpuSelection: null,
-        gpu: { pages, residentPageCount: pages.length },
+        gpu: { pages, residentPageCount: pages.length, arena: { buffer: {} as GPUBuffer } },
     } as unknown as MeshLoDAssetRuntime;
 }
 
@@ -301,23 +301,29 @@ describe("GPU selection orchestration (mock device)", () => {
     };
     const instance = { worldMatrix: IDENTITY, worldMatrixVersion: 1, visible: true, _instanceId: 0 };
 
-    it("submits one compute pass with four ordered dispatches and three resets", () => {
+    it("submits one compute pass with selection + expansion dispatches and resets", () => {
         const { engine, encoder } = createMockEngine();
         const runtime = fakeRuntime(fixture.hierarchy);
         const instanceState = createMeshLoDGpuInstanceState(fixture.hierarchy.groups.length);
         const batchState = createMeshLoDGpuBatchState();
         const updateBatch = getMeshLoDUpdateBatch({} as RenderTargetSignature);
         updateBatch.reset();
-        const handles = queueMeshLoDGpuSelection(engine, updateBatch, runtime, instanceState, batchState, [instance], frame);
+        const handles = queueMeshLoDGpuSelection(engine, updateBatch, runtime, instanceState, batchState, [instance], 12, frame);
         expect(handles).not.toBeNull();
         expect(handles!.selectedBuffer).toBeTruthy();
         expect(handles!.controlBuffer).toBeTruthy();
+        expect(handles!.drawVertexBuffer).toBeTruthy();
+        expect(handles!.drawArgsBuffer).toBeTruthy();
         updateBatch.flush(engine);
-        // One compute pass; traverse→evaluate→select→demand (4 dispatches); 3 resets.
-        expect(encoder.computePasses).toHaveLength(1);
-        expect(encoder.computePasses[0]!.dispatches).toHaveLength(4);
+        // Two compute passes: selection (traverse→evaluate→select→demand→clamp = 5 direct)
+        // then expansion (expandClusters indirect + finalizeDraw direct = 2); 5 resets.
+        expect(encoder.computePasses).toHaveLength(2);
+        expect(encoder.computePasses[0]!.dispatches).toHaveLength(5);
         expect(encoder.computePasses[0]!.dispatches.every((d) => d.kind === "direct")).toBe(true);
-        expect(encoder.clears.length).toBe(3);
+        expect(encoder.computePasses[1]!.dispatches).toHaveLength(2);
+        expect(encoder.computePasses[1]!.dispatches[0]!.kind).toBe("indirect");
+        expect(encoder.computePasses[1]!.dispatches[1]!.kind).toBe("direct");
+        expect(encoder.clears.length).toBe(5);
     });
 
     it("returns null and queues nothing for an empty batch", () => {
@@ -327,7 +333,7 @@ describe("GPU selection orchestration (mock device)", () => {
         const batchState = createMeshLoDGpuBatchState();
         const updateBatch = getMeshLoDUpdateBatch({} as RenderTargetSignature);
         updateBatch.reset();
-        expect(queueMeshLoDGpuSelection(engine, updateBatch, runtime, instanceState, batchState, [], frame)).toBeNull();
+        expect(queueMeshLoDGpuSelection(engine, updateBatch, runtime, instanceState, batchState, [], 12, frame)).toBeNull();
         updateBatch.flush(engine);
         expect(encoder.computePasses).toHaveLength(0);
     });

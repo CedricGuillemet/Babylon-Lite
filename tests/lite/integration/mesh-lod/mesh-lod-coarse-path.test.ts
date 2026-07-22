@@ -112,7 +112,7 @@ describe("MeshLoD lazy coarse path", () => {
     it("renders the coarse fallback through the public facade with fine data unavailable", async () => {
         const file = statueFile();
         const server = coarseOnlyServer(file, 400 * 1024);
-        const asset = await loadMeshLoD(engine, "https://cdn.test/statue.mlod", { request: { fetch: server.fetch } });
+        const asset = await loadMeshLoD(engine, "https://cdn.test/statue.mlod", { request: { fetch: server.fetch }, selectionMode: "cpu" });
 
         const { drawCount } = await renderCoarse(asset, engine);
         // No holes: coarse geometry rasterizes, one indirect draw, asset never failed.
@@ -125,7 +125,7 @@ describe("MeshLoD lazy coarse path", () => {
     it("keeps coarse geometry usable across repeated frames without requesting fine pages", async () => {
         const file = statueFile();
         const server = coarseOnlyServer(file, 400 * 1024);
-        const asset = await loadMeshLoD(engine, bufferOf(file));
+        const asset = await loadMeshLoD(engine, bufferOf(file), { selectionMode: "cpu" });
         const { scene } = await renderCoarse(asset, engine);
         const binding = scene._renderables[0]!.bind(engine, SIG);
         const ctx = { targetWidth: 800, targetHeight: 600, _camera: fakeCamera() };
