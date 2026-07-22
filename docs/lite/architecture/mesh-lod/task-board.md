@@ -4,7 +4,6 @@
 
 | M | ID | Task | Skill | Notes |
 |---|---|---|---|---|
-|  | T-15 | Execute implementation-plan/03_02_parse_mlod_buffers.md | execute-implementation-plan |  |
 |  | T-16 | Execute implementation-plan/03_03_range_source_bootstrap.md | execute-implementation-plan |  |
 |  | T-17 | Execute implementation-plan/03_04_cpu_selection_oracle.md | execute-implementation-plan |  |
 |  | T-18 | Execute implementation-plan/04_01_lazy_page_decoder.md | execute-implementation-plan |  |
@@ -47,6 +46,7 @@
 |  | T-12 | Execute implementation-plan/02_03_write_validate_publish.md | execute-implementation-plan | done 2026-07-22 - full container writer (header/dir/sections/pages + CRCs), independent validator, canonical stats, atomic multi-output publish; end-to-end grid->.mlod validates; CTest 7/7 |
 |  | T-13 | Execute implementation-plan/02_04_converter_fixtures_and_statue.md | execute-implementation-plan | done 2026-07-22 - statue converted to 3 .mlod (98366/119201/93519 src tris, 12 levels, 40/46/38 pages, exact terminal coverage); byte-identical repeat; --validate-only passes; assets+stats committed; CTest 7/7 |
 |  | T-14 | Execute implementation-plan/03_01_public_api_and_errors.md | execute-implementation-plan | done 2026-07-22 - c9016474; facade+errors+runtime types, option validation, no-side-effect lazy imports; lint(eslint+tsc)/26 unit tests green |
+|  | T-15 | Execute implementation-plan/03_02_parse_mlod_buffers.md | execute-implementation-plan | done 2026-07-22 - d0816a75; full LE parser/validator mirroring C++ validateContainer, CRC32C, record interfaces; 25 tests incl. 3 real statue assets vs statue-stats.json + 20-case mutation matrix; lint green |
 
 ## Untriaged
 
