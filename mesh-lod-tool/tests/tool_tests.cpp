@@ -448,11 +448,13 @@ std::vector<unsigned char> readFile(const std::string& path) {
                                       std::istreambuf_iterator<char>());
 }
 
-int convert(const std::string& fixtureName, const std::string& outputPath, bool validateOnly) {
+int convert(const std::string& fixtureName, const std::string& outputPath, bool validateOnly,
+            const std::string& statsPath = std::string()) {
     mlod::ConversionOptions options;
     options.inputPath = fixture(fixtureName);
     options.outputPath = outputPath;
     options.validateOnly = validateOnly;
+    options.statsJsonPath = statsPath;
     std::ostringstream outStream;
     std::ostringstream errStream;
     return mlod::runConversion(options, outStream, errStream);
@@ -461,16 +463,26 @@ int convert(const std::string& fixtureName, const std::string& outputPath, bool 
 void testEndToEnd() {
     namespace fs = std::filesystem;
 
-    // Single-primitive conversion writes exactly one container that revalidates.
+    // Single-primitive conversion writes exactly one container that revalidates,
+    // and emits canonical statistics with the required counts.
     const std::string gridOut = "e2e_grid.mlod";
+    const std::string gridStats = "e2e_grid.stats.json";
     fs::remove(gridOut);
-    expect(convert("grid.gltf", gridOut, false) == mlod::kExitSuccess, "grid converts end to end");
+    fs::remove(gridStats);
+    expect(convert("grid.gltf", gridOut, false, gridStats) == mlod::kExitSuccess,
+           "grid converts end to end");
     expect(fs::exists(gridOut), "grid output is written");
     std::vector<unsigned char> gridBytes = readFile(gridOut);
     std::ostringstream errStream;
     expect(mlod::validateContainer(gridBytes.data(), gridBytes.size(), errStream) ==
                mlod::kExitSuccess,
            "written grid container validates from disk");
+    const std::vector<unsigned char> statsBytes = readFile(gridStats);
+    const std::string statsText(statsBytes.begin(), statsBytes.end());
+    expect(contains(statsText, "\"sourceTriangleCount\":1152"), "stats report source triangles");
+    expect(contains(statsText, "\"pageCount\":") && contains(statsText, "\"groupCount\":") &&
+               contains(statsText, "\"pinnedPageCount\":"),
+           "stats report layout counts");
 
     // Determinism: a second conversion is byte-identical on disk.
     const std::string gridOut2 = "e2e_grid2.mlod";
@@ -510,7 +522,8 @@ void testEndToEnd() {
 
     // Clean up test artifacts and any stray temporaries.
     for (const std::string& path :
-         {gridOut, gridOut2, multi0, multi1, gridOut + ".tmp", multi0 + ".tmp", multi1 + ".tmp"}) {
+         {gridOut, gridOut2, gridStats, multi0, multi1, gridOut + ".tmp", multi0 + ".tmp",
+          multi1 + ".tmp"}) {
         fs::remove(path);
     }
 }

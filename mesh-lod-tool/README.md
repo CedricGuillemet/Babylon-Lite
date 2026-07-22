@@ -63,9 +63,46 @@ prints machine-readable `key=value` provenance (tool version, `.mlod` format
 version, both dependency revisions, and the compiler target) and requires no
 input asset.
 
-> Note: this scaffold implements `--help` and `--version` and validates its
-> argument surface. Geometry normalization, hierarchy generation, page packing,
-> and `.mlod` writing are delivered by subsequent tasks.
+When a conversion selects more than one primitive, the tool writes one container
+per primitive, inserting `.meshNNN.primNNN` (three-digit, zero-padded source
+indices) before the `.mlod` extension. Outputs are built and validated fully in
+memory and published atomically: nothing is renamed into place unless every
+selected primitive validates, so a failure leaves no partial output.
+
+## Statue asset (first end-to-end deliverable)
+
+`harvard-yenching_institute_statue.glb` at the repository root is three meshes
+with one primitive each. The committed `.mlod` deliverables and their canonical
+statistics are produced with the default (canonical) options:
+
+```powershell
+mesh-lod-tool --input harvard-yenching_institute_statue.glb `
+  --output lab/public/mesh-lod/harvard-yenching_institute_statue.mlod `
+  --stats-json lab/public/mesh-lod/statue-stats.json
+```
+
+This emits three sibling containers under `lab/public/mesh-lod/`
+(`...mesh000.prim000.mlod`, `...mesh001.prim000.mlod`, `...mesh002.prim000.mlod`)
+plus `statue-stats.json`. Conversion is deterministic: repeating it in a clean
+location produces byte-identical files. Do not modify the source GLB; the
+generated `.mlod` files are deliverables, not build products.
+
+## Serving `.mlod`
+
+`.mlod` containers are range-addressable and MUST be served with:
+
+- `Content-Encoding: identity` (no gzip/br/transfer transformation that changes
+  byte offsets), and
+- HTTP byte-range support (`Accept-Ranges: bytes`).
+
+The runtime bootstraps by reading the header and section directory from the
+first 64 KiB, then the contiguous metadata and pinned coarse pages inside
+`bootstrapBytes`, and finally requests individual fine pages by their
+page-table byte ranges. Any intermediary that re-encodes or coalesces the body
+so that byte offsets no longer match `fileBytes` is incompatible. A server that
+ignores a range request and returns the complete `200` body is tolerated (the
+loader retains the full file); other range/protocol failures are surfaced
+explicitly.
 
 ## Test
 
