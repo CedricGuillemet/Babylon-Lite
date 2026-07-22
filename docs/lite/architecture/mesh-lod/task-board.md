@@ -4,7 +4,6 @@
 
 | M | ID | Task | Skill | Notes |
 |---|---|---|---|---|
-|  | T-06 | Execute implementation-plan/01_01_scaffold_converter.md | execute-implementation-plan |  |
 |  | T-07 | Execute implementation-plan/01_02_cli_and_primitive_selection.md | execute-implementation-plan |  |
 |  | T-08 | Execute implementation-plan/01_03_normalize_gltf_geometry.md | execute-implementation-plan |  |
 |  | T-09 | Execute implementation-plan/01_04_build_cluster_hierarchy.md | execute-implementation-plan |  |
@@ -47,6 +46,7 @@
 |  | T-03 | Requirements | write-requirements | done 2026-07-22 - requirements.md |
 |  | T-04 | Architecture | write-architecture | done 2026-07-22 - architecture.md |
 |  | T-05 | Implementation plan | write-implementation-plan | done 2026-07-22 - implementation-plan/ (33 tasks) |
+|  | T-06 | Execute implementation-plan/01_01_scaffold_converter.md | execute-implementation-plan | done 2026-07-22 - configure+build+CTest 6/6; meshoptimizer+cgltf pinned to exact SHAs |
 
 ## Untriaged
 
