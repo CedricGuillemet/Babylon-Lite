@@ -23,7 +23,17 @@ import type { RenderTargetSignature } from "../engine/render-target.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDFrustumPlane } from "./mesh-lod-selection-math.js";
 import { extractFrustumPlanes, maxColumnScale, perspectivePixelScale, projectSphere, sphereOutsidePlanes } from "./mesh-lod-selection-math.js";
-import type { MeshLoDAssetRuntime, MeshLoDCluster, MeshLoDGroup, MeshLoDHierarchyNode, MeshLoDPageRecord, MeshLoDPageRuntime } from "./mesh-lod-runtime.js";
+import type {
+    MeshLoDAssetRuntime,
+    MeshLoDCluster,
+    MeshLoDGroup,
+    MeshLoDHierarchyNode,
+    MeshLoDPageRecord,
+    MeshLoDPageRuntime,
+    MeshLoDStreamSelectionStats,
+} from "./mesh-lod-runtime.js";
+import { stepMeshLoDStreaming } from "./mesh-lod-runtime.js";
+import type { MeshLoDPageDemand } from "./mesh-lod-scheduler.js";
 import selectionWgsl from "./mesh-lod-selection.wgsl?raw";
 
 // ─── Record word/byte layouts (architecture §12.1) ───────────────────
@@ -860,7 +870,8 @@ const PARAMS_ALLOC = 256;
 const CONTROL_DIAG_OFFSET = 4;
 /** diag words: visibleGroupCount, renderedTriangleCount, overflow, fallbackGroupCount. */
 const CONTROL_DIAG_WORDS = 4;
-const CONTROL_PAGE_DEMAND_OFFSET = CONTROL_DIAG_OFFSET + CONTROL_DIAG_WORDS;
+/** First control word of the per-page demand region (one benefit accumulator per page). */
+export const CONTROL_PAGE_DEMAND_OFFSET = CONTROL_DIAG_OFFSET + CONTROL_DIAG_WORDS;
 const SELECTION_WORKGROUP = 64;
 
 /** Diagnostics word indices within the control buffer (relative to its base). */
@@ -870,6 +881,47 @@ export const CONTROL_VISIBLE_GROUP_WORD = CONTROL_DIAG_OFFSET;
 export const CONTROL_TRIANGLE_WORD = CONTROL_DIAG_OFFSET + 1;
 export const CONTROL_OVERFLOW_WORD = CONTROL_DIAG_OFFSET + 2;
 export const CONTROL_FALLBACK_WORD = CONTROL_DIAG_OFFSET + 3;
+
+/** Fixed-point scale the `computeDemand` kernel accumulates per-page benefit with
+ *  (`FIXED_SCALE` in mesh-lod-selection.wgsl). Readback divides it back out. */
+const DEMAND_FIXED_SCALE = 256;
+
+/** Decoded GPU selection readback: streaming page demand plus the per-frame diagnostics
+ *  the control buffer accumulates (architecture §12.3 step 8). */
+export interface MeshLoDGpuReadback {
+    /** Missing demanded pages, sorted by descending priority then ascending id. */
+    readonly demand: MeshLoDPageDemand[];
+    readonly selectedClusterCount: number;
+    readonly renderedTriangleCount: number;
+    readonly visibleGroupCount: number;
+    readonly fallbackGroupCount: number;
+    readonly overflow: boolean;
+}
+
+/** Decode a copied selection control buffer into streaming demand + diagnostics. Each
+ *  per-page word holds accumulated benefit (pageShare × {@link DEMAND_FIXED_SCALE});
+ *  dividing by the page's stored bytes reproduces the CPU oracle's benefit/cost priority
+ *  (§11.1). Pure over the control words + a stored-bytes accessor so Node fixtures can
+ *  compare it against the deterministic selection model. */
+export function decodeMeshLoDGpuReadback(control: ArrayLike<number>, pageCount: number, storedBytesOf: (pageId: number) => number): MeshLoDGpuReadback {
+    const demand: MeshLoDPageDemand[] = [];
+    for (let pageId = 0; pageId < pageCount; pageId++) {
+        const benefit = control[CONTROL_PAGE_DEMAND_OFFSET + pageId] ?? 0;
+        if (benefit > 0) {
+            const stored = storedBytesOf(pageId) || 1;
+            demand.push({ pageId, priority: benefit / DEMAND_FIXED_SCALE / stored });
+        }
+    }
+    demand.sort((a, b) => (b.priority !== a.priority ? b.priority - a.priority : a.pageId - b.pageId));
+    return {
+        demand,
+        selectedClusterCount: control[CONTROL_COUNT_WORD] ?? 0,
+        renderedTriangleCount: control[CONTROL_TRIANGLE_WORD] ?? 0,
+        visibleGroupCount: control[CONTROL_VISIBLE_GROUP_WORD] ?? 0,
+        fallbackGroupCount: control[CONTROL_FALLBACK_WORD] ?? 0,
+        overflow: (control[CONTROL_OVERFLOW_WORD] ?? 0) !== 0,
+    };
+}
 
 interface MeshLoDSelectionPipelines {
     readonly device: GPUDevice;
@@ -979,6 +1031,13 @@ export interface MeshLoDGpuBatchState {
     /** Per-instance draw-vertex bound (coarse expanded vertices) the buffer is sized from. */
     drawVertexBound: number;
     boundArena: GPUBuffer | null;
+    // ── Task 7 (GPU streaming) async demand readback + adaptive draw growth ──
+    /** Small ring of MAP_READ staging buffers the control buffer is copied into each
+     *  frame; each entry maps independently so the CPU→GPU→CPU demand loop never stalls. */
+    readbackSlots: MeshLoDReadbackSlot[];
+    /** Per-instance draw-vertex bound ratcheted up by the async readback as streamed
+     *  refinement selects more triangles, so GPU mode renders past the coarse bound. */
+    growthDrawVertexBound: number;
 }
 
 /** Create empty per-batch transient selection state. */
@@ -1011,6 +1070,8 @@ export function createMeshLoDGpuBatchState(): MeshLoDGpuBatchState {
         drawVertexCapacity: 0,
         drawVertexBound: 0,
         boundArena: null,
+        readbackSlots: [],
+        growthDrawVertexBound: 0,
     };
 }
 
@@ -1031,6 +1092,11 @@ function ensureMeshLoDBatchBuffers(
         state.bindGroup = state.expandBindGroup = null;
         state.instanceCapacity = 0;
         state.drawVertexCapacity = 0;
+        for (const slot of state.readbackSlots) {
+            slot.buffer.destroy();
+        }
+        state.readbackSlots = [];
+        state.growthDrawVertexBound = 0;
         state.device = device;
     }
     state.groupCount = assetBuffers.groupCount;
@@ -1159,11 +1225,123 @@ export function disposeMeshLoDGpuBatchState(state: MeshLoDGpuBatchState): void {
     state.paramsBuffer?.destroy();
     state.drawVertexBuffer?.destroy();
     state.drawArgsBuffer?.destroy();
+    for (const slot of state.readbackSlots) {
+        slot.buffer.destroy();
+    }
+    state.readbackSlots = [];
+    state.growthDrawVertexBound = 0;
     state.groupStateBuffer = state.selectedBuffer = state.controlBuffer = state.paramsBuffer = null;
     state.drawVertexBuffer = state.drawArgsBuffer = null;
     state.bindGroup = state.expandBindGroup = null;
     state.instanceCapacity = 0;
     state.drawVertexCapacity = 0;
+}
+
+// ─── Async demand readback + adaptive draw growth (architecture §12.3 step 8) ──
+
+const READBACK_RING = 3;
+
+interface MeshLoDReadbackSlot {
+    readonly buffer: GPUBuffer;
+    busy: boolean;
+}
+
+/** One queued control-buffer readback: the copy source, its MAP_READ staging slot, and
+ *  the decode/apply closure run once the frame submits. */
+interface MeshLoDReadbackJob {
+    readonly control: GPUBuffer;
+    readonly slot: MeshLoDReadbackSlot;
+    readonly bytes: number;
+    readonly apply: (control: Uint32Array) => void;
+}
+
+/** Reserve a free MAP_READ staging slot from the batch's small ring (growing it up to
+ *  {@link READBACK_RING}); returns `null` when every slot still has a map in flight, so
+ *  the frame skips the readback rather than stall. */
+function acquireMeshLoDReadbackSlot(engine: EngineContext, state: MeshLoDGpuBatchState, bytes: number): MeshLoDReadbackSlot | null {
+    for (const slot of state.readbackSlots) {
+        if (!slot.busy) {
+            slot.busy = true;
+            return slot;
+        }
+    }
+    if (state.readbackSlots.length >= READBACK_RING) {
+        return null;
+    }
+    const buffer = engine._device.createBuffer({ label: "mesh-lod-readback", size: bytes, usage: BU.MAP_READ | BU.COPY_DST });
+    const slot: MeshLoDReadbackSlot = { buffer, busy: true };
+    state.readbackSlots.push(slot);
+    return slot;
+}
+
+/** Map the staging copy after the frame submits, decode it, and release the slot. The
+ *  `await Promise.resolve()` lets the frame's encoder submit first (a buffer with a
+ *  pending map cannot be used by an in-flight submit — see engine/screenshot-readback.ts). */
+async function pumpMeshLoDReadback(job: MeshLoDReadbackJob): Promise<void> {
+    const { slot } = job;
+    try {
+        await Promise.resolve();
+        await slot.buffer.mapAsync(GPUMapMode.READ, 0, job.bytes);
+        const control = new Uint32Array(slot.buffer.getMappedRange(0, job.bytes).slice(0));
+        slot.buffer.unmap();
+        job.apply(control);
+    } catch {
+        // Device lost / disposed / destroyed staging — drop this frame's readback.
+    } finally {
+        slot.busy = false;
+    }
+}
+
+/** Ratchet the draw-vertex growth bound up so `neededVertices` (the GPU-reported selected
+ *  triangle count × 3, across all instances) fits next frame. Doubles for amortized growth
+ *  and never shrinks, mirroring the CPU path's make-before-break growth. */
+function growMeshLoDDrawBound(state: MeshLoDGpuBatchState, neededVertices: number): void {
+    if (neededVertices <= state.drawVertexCapacity) {
+        return;
+    }
+    const cap = Math.max(state.instanceCapacity, 1);
+    const target = Math.ceil(neededVertices / cap);
+    let bound = Math.max(state.growthDrawVertexBound, state.drawVertexBound, 1);
+    while (bound < target) {
+        bound *= 2;
+    }
+    if (bound > state.growthDrawVertexBound) {
+        state.growthDrawVertexBound = bound;
+    }
+}
+
+/** Apply one frame's async GPU selection readback: decode per-page demand + diagnostics
+ *  from the control buffer, drive the shared streaming engine (demand + resident frame
+ *  references + diagnostics), and ratchet the draw-vertex growth bound so streamed
+ *  refinement renders past the coarse bound. A stale readback (disposed asset, or a
+ *  generation bump from disposal/device recovery) is dropped. Exported as the internal
+ *  test seam that stands in for the real mapAsync resolution. */
+export function applyMeshLoDGpuReadback(runtime: MeshLoDAssetRuntime, state: MeshLoDGpuBatchState, control: Uint32Array, pageCount: number, generation: number): void {
+    if (runtime.disposed || runtime.generation !== generation) {
+        return;
+    }
+    const records = runtime.pageRecords;
+    const decoded = decodeMeshLoDGpuReadback(control, pageCount, (pageId) => records[pageId]?.storedBytes ?? 1);
+    // Frame references: every currently gpu-resident page (pinned + streamed fine) may
+    // be read by the in-flight command buffer, so hold it and keep its LRU age fresh.
+    const referenced: number[] = [];
+    const pages = runtime.gpu.pages;
+    for (let i = 0; i < pages.length; i++) {
+        if (pages[i]!.state === "gpu-resident") {
+            referenced.push(i);
+        }
+    }
+    const diag = runtime.diagnostics as { renderedTriangleCount: number; selectedMeshletCount: number };
+    diag.renderedTriangleCount = decoded.renderedTriangleCount;
+    diag.selectedMeshletCount = decoded.selectedClusterCount;
+    const stats: MeshLoDStreamSelectionStats = {
+        visibleGroupCount: decoded.visibleGroupCount,
+        fallbackGroupCount: decoded.fallbackGroupCount,
+        maximumSelectedErrorPixels: 0,
+        maximumUnmetErrorPixels: 0,
+    };
+    stepMeshLoDStreaming(runtime, decoded.demand, referenced, stats);
+    growMeshLoDDrawBound(state, decoded.renderedTriangleCount * 3);
 }
 
 /** Camera + selection inputs for one frame's GPU selection, produced by the scene from
@@ -1253,6 +1431,9 @@ interface MeshLoDSelectionJob {
     /** Expansion pass (expandClusters indirect → finalizeDraw). Separated from pass 1
      *  so `control` is never writable storage and indirect in one synchronization scope. */
     readonly pass2Steps: MeshLoDComputeStep[];
+    /** Async page-demand + diagnostics readback of the control buffer, copied after the
+     *  compute passes and mapped once the frame submits (architecture §12.3 step 8). */
+    readonly readback?: MeshLoDReadbackJob;
 }
 
 function replaySteps(pass: GPUComputePassEncoder, steps: readonly MeshLoDComputeStep[]): void {
@@ -1316,6 +1497,16 @@ export function getMeshLoDUpdateBatch(signature: RenderTargetSignature): MeshLoD
                 replaySteps(expandPass, jobs[i]!.pass2Steps);
             }
             expandPass.end();
+            // Copy each batch's control buffer (page demand + diagnostics) to its MAP_READ
+            // staging slot AFTER the compute passes, then map it once the frame submits
+            // (architecture §12.3 step 8). The async result drives GPU-mode streaming.
+            for (let i = 0; i < count; i++) {
+                const rb = jobs[i]!.readback;
+                if (rb) {
+                    encoder.copyBufferToBuffer(rb.control, 0, rb.slot.buffer, 0, rb.bytes);
+                    void pumpMeshLoDReadback(rb);
+                }
+            }
         },
         destroy(): void {
             jobs.length = 0;
@@ -1365,7 +1556,10 @@ export function queueMeshLoDGpuSelection(
     const assetBuffers = getMeshLoDGpuAssetBuffers(engine, runtime);
     const instanceCount = uploadMeshLoDInstances(engine, instanceState, instances);
     syncMeshLoDPageState(engine, assetBuffers, runtime);
-    ensureMeshLoDBatchBuffers(engine, batchState, instanceState.capacity, drawVertexBound, assetBuffers);
+    // Coarse per-instance bound, ratcheted up by the async readback as streamed refinement
+    // selects more triangles, so the GPU draw stream grows past the coarse LOD.
+    const effectiveDrawBound = Math.max(drawVertexBound, batchState.growthDrawVertexBound);
+    ensureMeshLoDBatchBuffers(engine, batchState, instanceState.capacity, effectiveDrawBound, assetBuffers);
     ensureMeshLoDBindGroup(engine, batchState, pipelines, assetBuffers, instanceState, runtime.gpu.arena.buffer);
     writeSelectionParams(batchState, assetBuffers, instanceCount, instanceState.wordsPerInstance, frame);
     engine._device.queue.writeBuffer(batchState.paramsBuffer!, 0, batchState.paramsBytes, 0, PARAMS_BYTES);
@@ -1375,6 +1569,21 @@ export function queueMeshLoDGpuSelection(
     const groupInvocations = Math.ceil((batchState.groupCount * instanceCount) / SELECTION_WORKGROUP);
     const nodeInvocations = Math.ceil((batchState.nodeCount * instanceCount) / SELECTION_WORKGROUP);
     const clusterInvocations = Math.ceil((batchState.clusterCount * instanceCount) / SELECTION_WORKGROUP);
+
+    // Reserve a staging slot and build the demand/diagnostics readback for this frame.
+    // Skipped only when every ring slot still has a map in flight.
+    const readbackBytes = batchState.controlWords * 4;
+    const readbackSlot = acquireMeshLoDReadbackSlot(engine, batchState, readbackBytes);
+    const generation = runtime.generation;
+    const pageCount = assetBuffers.pageCount;
+    const readback: MeshLoDReadbackJob | undefined = readbackSlot
+        ? {
+              control: batchState.controlBuffer!,
+              slot: readbackSlot,
+              bytes: readbackBytes,
+              apply: (control) => applyMeshLoDGpuReadback(runtime, batchState, control, pageCount, generation),
+          }
+        : undefined;
 
     const job: MeshLoDSelectionJob = {
         clears: [
@@ -1397,6 +1606,7 @@ export function queueMeshLoDGpuSelection(
             { pipeline: pipelines.expand, bindGroup: expandBindGroup, indirectBuffer: batchState.controlBuffer!, indirectOffset: 0 },
             { pipeline: pipelines.finalize, bindGroup: expandBindGroup, workgroups: 1 },
         ],
+        readback,
     };
     updateBatch.queue(job);
 
