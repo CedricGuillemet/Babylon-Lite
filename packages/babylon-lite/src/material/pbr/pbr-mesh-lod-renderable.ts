@@ -13,6 +13,7 @@
 import { BU } from "../../engine/gpu-flags.js";
 import type { EngineContext } from "../../engine/engine.js";
 import { retireGpuResources } from "../../engine/gpu-resource-retirement.js";
+import { invalidateRenderBundles } from "../../mesh/mesh-factories.js";
 import type { SceneContext } from "../../scene/scene-core.js";
 import type { Mat4 } from "../../math/types.js";
 import type { DrawBinding, DrawUpdateContext, Renderable } from "../../render/renderable.js";
@@ -290,6 +291,10 @@ function ensureCpuDrawCapacity(engine: EngineContext, batch: MeshLoDSceneBatch, 
     packet.drawScratch = new Uint32Array(capacity * 4);
     packet.maxDrawVertices = capacity;
     packet.bindGroup = buildBindGroup(engine, packet.bindGroupLayout, batch.material, packet.drawVertexBuffer, packet.instanceBuffer, runtime.gpu.arena.buffer, packet.materialUbo);
+    // The opaque draw is baked into a cached render bundle; force it to re-record this
+    // frame with the new bind group (this runs in the update phase, before the render
+    // pass) so the retired buffer is never replayed after destruction.
+    invalidateRenderBundles(engine);
     retireGpuResources(engine, () => oldBuffer.destroy());
 }
 
@@ -419,6 +424,9 @@ function updatePacketGpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet
         packet.gpuBindGroup = buildBindGroup(engine, packet.bindGroupLayout, batch.material, handles.drawVertexBuffer, handles.instanceBuffer, packet.arena, packet.materialUbo);
         packet.gpuBoundDrawVertices = handles.drawVertexBuffer;
         packet.gpuBoundInstances = handles.instanceBuffer;
+        // The cached opaque render bundle bakes this bind group; re-record it this frame
+        // when the GPU draw/instance buffers grow (make-before-break).
+        invalidateRenderBundles(engine);
     }
     packet.activeBindGroup = packet.gpuBindGroup;
     packet.activeIndirectBuffer = handles.drawArgsBuffer;

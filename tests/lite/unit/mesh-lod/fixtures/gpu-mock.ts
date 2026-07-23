@@ -207,7 +207,7 @@ export function createMockEncoder(): MockEncoder {
  *  submission can be asserted. */
 export function createMockEngine(device: MockDevice = createMockDevice()): { engine: EngineContext; device: MockDevice; encoder: MockEncoder } {
     const encoder = createMockEncoder();
-    const engine = { _device: device, _currentEncoder: encoder, _retirements: null } as unknown as EngineContext;
+    const engine = { _device: device, _currentEncoder: encoder, _retirements: null, _renderingContexts: [] } as unknown as EngineContext;
     return { engine, device, encoder };
 }
 
