@@ -25,6 +25,7 @@ import {
     arenaUsedBytes,
     createMeshLoDArena,
     createMeshLoDCpuPageCache,
+    clearMeshLoDCpuPageCache,
     cpuCacheUsedBytes,
     evictMeshLoDToBudget,
     floorToBlocks,
@@ -568,6 +569,10 @@ function ensureMeshLoDScheduler(runtime: MeshLoDAssetRuntime): MeshLoDRequestSch
  *  fits without evicting protected pages the page stays unrequested for a later frame,
  *  its encoded bytes retained. */
 function commitStreamedPage(runtime: MeshLoDAssetRuntime, pageId: number, bytes: Uint8Array): void {
+    if (runtime.disposed) {
+        // A completion racing disposal must never allocate arena or mark a page resident.
+        return;
+    }
     const record = runtime.pageRecords[pageId]!;
     const page = runtime.gpu.pages[pageId]!;
     // Retain the encoded bytes (unpinned, LRU-bounded) so device recovery / re-demand
@@ -617,7 +622,7 @@ function commitStreamedPage(runtime: MeshLoDAssetRuntime, pageId: number, bytes:
  *  that already reached residency ignores a late failure. */
 function failStreamedPage(runtime: MeshLoDAssetRuntime, pageId: number, error: MeshLoDError): void {
     const page = runtime.gpu.pages[pageId]!;
-    if (page.state === "gpu-resident") {
+    if (runtime.disposed || page.state === "gpu-resident") {
         return;
     }
     page.state = "terminal-failed";
@@ -753,4 +758,33 @@ export function _disposeMeshLoDScheduler(runtime: MeshLoDAssetRuntime): void {
         disposeMeshLoDRequestScheduler(runtime.scheduler);
         runtime.scheduler = null;
     }
+}
+
+/** @internal Free an asset's GPU + CPU residency on disposal (§14.2). The geometry
+ *  arena and the shared per-asset selection buffers retire only after the next
+ *  submitted frame that could reference them drains (make-before-break / frame safety,
+ *  REQ-RENDER-4); the batch draw path stops immediately (disposed batches are
+ *  non-drawable), so retained CPU page bytes and decoded indices are released now.
+ *  Idempotent-safe: repeated disposal is guarded by the caller. */
+export function _disposeMeshLoDResources(runtime: MeshLoDAssetRuntime): void {
+    const engine = runtime.engine;
+    const arenaBuffer = runtime.gpu?.arena.buffer;
+    const selection = runtime.gpuSelection;
+    runtime.gpuSelection = null;
+    retireGpuResources(engine, () => {
+        arenaBuffer?.destroy?.();
+        selection?.metaBuffer.destroy?.();
+        selection?.pageStateBuffer.destroy?.();
+    });
+    if (runtime.gpu) {
+        for (const page of runtime.gpu.pages) {
+            page.indices = null;
+            page.state = "disposed";
+            page.arenaOffset = -1;
+            page.arenaBytes = 0;
+            page.frameRefCount = 0;
+        }
+        runtime.gpu.residentPageCount = 0;
+    }
+    clearMeshLoDCpuPageCache(runtime.cpuPageCache);
 }

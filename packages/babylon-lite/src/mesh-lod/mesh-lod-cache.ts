@@ -372,3 +372,11 @@ export function setMeshLoDCpuCacheBudget(cache: MeshLoDCpuPageCache, budgetBytes
     cache.budgetBytes = budgetBytes;
     evictCpuToFit(cache, -1);
 }
+
+/** Drop every retained entry (pinned and unpinned) and reset the used byte count.
+ *  Called on asset disposal once scene registries have stopped drawing the asset, so
+ *  retained encoded bytes and decoded metadata are released (§14.2). */
+export function clearMeshLoDCpuPageCache(cache: MeshLoDCpuPageCache): void {
+    cache.entries.clear();
+    cache.usedBytes = 0;
+}

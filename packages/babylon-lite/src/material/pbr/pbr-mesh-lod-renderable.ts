@@ -153,6 +153,8 @@ interface MeshLoDBatchPacket {
     /** Per-instance coarse expanded-vertex bound, for GPU draw-vertex buffer sizing. */
     readonly coarseVertices: number;
     lastVertexCount: number;
+    /** True once a disposed asset has re-recorded the cached bundle to drop its draw. */
+    disposedHandled: boolean;
     // ── GPU selection/expansion path (created lazily on first GPU-mode frame) ──
     gpuInstanceState: MeshLoDGpuInstanceState | null;
     gpuBatchState: MeshLoDGpuBatchState | null;
@@ -365,8 +367,10 @@ function updatePacketCpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet
     packet.indirectScratch[3] = 0;
     engine._device.queue.writeBuffer(packet.indirectBuffer, 0, packet.indirectScratch.buffer, packet.indirectScratch.byteOffset, 16);
     packet.lastVertexCount = vertexCount;
-    packet.activeBindGroup = packet.bindGroup;
-    packet.activeIndirectBuffer = packet.indirectBuffer;
+    // An empty batch (no visible instances / no expanded vertices) is non-drawable, so the
+    // draw closure issues zero draw calls — matching the GPU path and architecture §13.4.
+    packet.activeBindGroup = vertexCount > 0 ? packet.bindGroup : null;
+    packet.activeIndirectBuffer = vertexCount > 0 ? packet.indirectBuffer : null;
 
     const diag = runtime.diagnostics as { renderedTriangleCount: number; selectedMeshletCount: number };
     diag.renderedTriangleCount = vertexCount / 3;
@@ -432,9 +436,21 @@ function updatePacketGpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet
     packet.activeIndirectBuffer = handles.drawArgsBuffer;
 }
 
-/** Dispatch the per-frame update to the CPU reference or GPU production path. */
+/** Dispatch the per-frame update to the CPU reference or GPU production path. A disposed
+ *  asset is non-drawable immediately: clear the resolved binding and re-record the cached
+ *  render bundle once so the retired arena/draw buffers are never replayed (§14.2). */
 function updatePacket(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, context: DrawUpdateContext, updateBatch: MeshLoDUpdateBatch | undefined): void {
-    if (updateBatch && batch.asset._runtime.selectionMode === "gpu") {
+    const runtime = batch.asset._runtime;
+    if (runtime.disposed) {
+        packet.activeBindGroup = null;
+        packet.activeIndirectBuffer = null;
+        if (!packet.disposedHandled) {
+            packet.disposedHandled = true;
+            invalidateRenderBundles(engine);
+        }
+        return;
+    }
+    if (updateBatch && runtime.selectionMode === "gpu") {
         updatePacketGpu(engine, batch, packet, context, updateBatch);
     } else {
         updatePacketCpu(engine, batch, packet, context);
@@ -489,6 +505,7 @@ export function buildMeshLoDBatchRenderable(engine: EngineContext, _scene: Scene
         maxInstances,
         coarseVertices,
         lastVertexCount: 0,
+        disposedHandled: false,
         gpuInstanceState: null,
         gpuBatchState: null,
         gpuBindGroup: null,
@@ -522,7 +539,7 @@ export function buildMeshLoDBatchRenderable(engine: EngineContext, _scene: Scene
                 pipeline,
                 update: (context: DrawUpdateContext) => updatePacket(eng, batch, packet, context, updateBatch),
                 draw: (pass: GPURenderPassEncoder | GPURenderBundleEncoder): number => {
-                    if (!packet.activeBindGroup || !packet.activeIndirectBuffer) {
+                    if (batch.asset._runtime.disposed || !packet.activeBindGroup || !packet.activeIndirectBuffer) {
                         return 0;
                     }
                     pass.setBindGroup(1, packet.activeBindGroup);

@@ -353,8 +353,10 @@ export function getMeshLoDDiagnostics(asset: MeshLoDAsset): MeshLoDDiagnostics {
     return asset.diagnostics;
 }
 
-/** Dispose an asset: abort outstanding work, invalidate completions, free the GPU
- *  arena, and mark it disposed. Idempotent. */
+/** Dispose an asset: abort outstanding work, invalidate completions, mark scene batches
+ *  non-drawable, retire the GPU arena/selection buffers after frame safety, release
+ *  retained CPU bytes, and mark it disposed. Idempotent. Does not dispose an asset still
+ *  used by another scene — that is scene disposal's concern. */
 export function disposeMeshLoDAsset(asset: MeshLoDAsset): void {
     const runtime = asset._runtime;
     if (runtime.disposed) {
@@ -363,13 +365,8 @@ export function disposeMeshLoDAsset(asset: MeshLoDAsset): void {
     runtime.disposed = true;
     runtime.generation += 1;
     runtime.abortController.abort();
-    _runtimeModule?._disposeMeshLoDScheduler(runtime);
-    runtime.gpu?.arena.buffer.destroy?.();
-    const sel = runtime.gpuSelection;
-    if (sel) {
-        sel.metaBuffer.destroy?.();
-        sel.pageStateBuffer.destroy?.();
-        runtime.gpuSelection = null;
-    }
+    const mod = _runtimeModule;
+    mod?._disposeMeshLoDScheduler(runtime);
+    mod?._disposeMeshLoDResources(runtime);
     asset.state = "disposed";
 }
