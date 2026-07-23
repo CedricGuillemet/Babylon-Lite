@@ -9,7 +9,7 @@
 
 import { BU } from "../engine/gpu-flags.js";
 import type { EngineContext } from "../engine/engine.js";
-import type { MeshLoDPageRecord } from "./mesh-lod-runtime.js";
+import type { MeshLoDPageRecord, MeshLoDPageRuntime } from "./mesh-lod-runtime.js";
 import { PAGE_ALIGNMENT, PAGE_MAX_BYTES } from "./mesh-lod-format.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
 
@@ -149,4 +149,205 @@ export function destroyMeshLoDArena(arena: MeshLoDArena): void {
     arena.pinnedBlocks.fill(0);
     arena.committedBlocks = 0;
     arena.pinnedCount = 0;
+}
+
+// ─── GPU residency eviction (architecture §11.4) ─────────────────────
+
+/** Effective-budget + hysteresis inputs for one reservation attempt. */
+export interface MeshLoDEvictionPolicy {
+    /** Effective GPU residency budget in bytes (≤ arena capacity). Pinned pages count
+     *  toward it. Changing the budget never reallocates the arena. */
+    readonly budgetBytes: number;
+    /** Current selection frame, for LRU age and residency-hold eligibility. */
+    readonly currentFrame: number;
+    /** Frames a resident fine page must be untouched before it can be evicted. */
+    readonly residencyHoldFrames: number;
+}
+
+/** A resident fine page is an eviction candidate only when it is unpinned, fully
+ *  GPU-resident (never mid-fetch/decode/upload), unreferenced by the current frame,
+ *  and older than the residency hold (REQ-CACHE-3, REQ-CACHE-4). */
+function isEvictable(page: MeshLoDPageRuntime, record: MeshLoDPageRecord, policy: MeshLoDEvictionPolicy): boolean {
+    return (
+        page.state === "gpu-resident" &&
+        !record.pinned &&
+        page.frameRefCount === 0 &&
+        page.arenaOffset >= 0 &&
+        page.arenaBytes > 0 &&
+        policy.currentFrame - page.lastUsedFrame >= policy.residencyHoldFrames
+    );
+}
+
+/** Victim priority: oldest last-used first, then lower demand priority, then higher
+ *  page id (architecture §11.4). Returns true when `a` should be evicted before `b`. */
+function victimBefore(a: MeshLoDPageRuntime, b: MeshLoDPageRuntime): boolean {
+    if (a.lastUsedFrame !== b.lastUsedFrame) {
+        return a.lastUsedFrame < b.lastUsedFrame;
+    }
+    if (a.priority !== b.priority) {
+        return a.priority < b.priority;
+    }
+    return a.id > b.id;
+}
+
+function pickVictim(pages: readonly MeshLoDPageRuntime[], records: readonly MeshLoDPageRecord[], policy: MeshLoDEvictionPolicy): MeshLoDPageRuntime | null {
+    let best: MeshLoDPageRuntime | null = null;
+    for (const page of pages) {
+        if (!isEvictable(page, records[page.id]!, policy)) {
+            continue;
+        }
+        if (!best || victimBefore(page, best)) {
+            best = page;
+        }
+    }
+    return best;
+}
+
+/** Free a resident page's arena run and reset its runtime record to `unrequested`,
+ *  appending its id to `evicted` for GPU page-state sync. */
+export function evictMeshLoDPage(arena: MeshLoDArena, page: MeshLoDPageRuntime, evicted: number[]): void {
+    if (page.arenaOffset >= 0 && page.arenaBytes > 0) {
+        freeArenaRun(arena, page.arenaOffset, page.arenaBytes);
+    }
+    page.state = "unrequested";
+    page.arenaOffset = -1;
+    page.arenaBytes = 0;
+    page.indices = null;
+    page.frameRefCount = 0;
+    page.priority = 0;
+    evicted.push(page.id);
+}
+
+/** Reserve a contiguous decoded-page run for a fine page within the effective budget,
+ *  evicting eligible resident victims (oldest use, then lower priority, then higher id)
+ *  first to satisfy the budget and then to defragment. Every evicted page's id is
+ *  appended to `evicted` so the caller can sync GPU page-state and diagnostics. Returns
+ *  the reserved byte offset, or `null` when the page cannot fit without evicting
+ *  protected (pinned / current-frame / in-flight / young) pages — in which case nothing
+ *  is allocated and the page stays pending for a later frame (REQ-CACHE-1, §11.4). */
+export function reserveMeshLoDArenaRun(
+    arena: MeshLoDArena,
+    pages: readonly MeshLoDPageRuntime[],
+    records: readonly MeshLoDPageRecord[],
+    decodedBytes: number,
+    policy: MeshLoDEvictionPolicy,
+    evicted: number[]
+): number | null {
+    const newBytes = roundPageAllocation(decodedBytes);
+    if (newBytes > PAGE_MAX_BYTES) {
+        return null;
+    }
+    // 1. Budget: evict eligible victims until the new page fits within the effective
+    //    budget. Committed residency (pinned + resident fine) must not exceed budget.
+    while (arenaUsedBytes(arena) + newBytes > policy.budgetBytes) {
+        const victim = pickVictim(pages, records, policy);
+        if (!victim) {
+            return null;
+        }
+        evictMeshLoDPage(arena, victim, evicted);
+    }
+    // 2. Allocate; on fragmentation evict more eligible victims and retry until a
+    //    contiguous run is available or no eligible victims remain.
+    let offset = allocateArenaRun(arena, decodedBytes, false);
+    while (offset === null) {
+        const victim = pickVictim(pages, records, policy);
+        if (!victim) {
+            return null;
+        }
+        evictMeshLoDPage(arena, victim, evicted);
+        offset = allocateArenaRun(arena, decodedBytes, false);
+    }
+    return offset;
+}
+
+// ─── CPU encoded-page cache (architecture §11.5) ─────────────────────
+
+interface CpuCacheEntry {
+    bytes: Uint8Array;
+    pinned: boolean;
+    lastUsed: number;
+}
+
+/** Retained encoded (`.mlod` stored) page bytes, bounded by `budgetBytes`. Pinned
+ *  encoded pages are always retained and count toward the budget; unpinned pages evict
+ *  by the same last-used ordering. Retained bytes let device recovery re-decode without
+ *  re-fetching. */
+export interface MeshLoDCpuPageCache {
+    /** Mutable byte budget (default `cpuPageCacheBytes`). */
+    budgetBytes: number;
+    /** Sum of retained entry byte lengths. */
+    usedBytes: number;
+    readonly entries: Map<number, CpuCacheEntry>;
+}
+
+export function createMeshLoDCpuPageCache(budgetBytes: number): MeshLoDCpuPageCache {
+    return { budgetBytes, usedBytes: 0, entries: new Map() };
+}
+
+/** Bytes currently retained by the CPU encoded-page cache. */
+export function cpuCacheUsedBytes(cache: MeshLoDCpuPageCache): number {
+    return cache.usedBytes;
+}
+
+/** Evict unpinned entries by oldest last-used (ties: higher id) until within budget or
+ *  no evictable entry remains. `protectId` is never evicted (the just-inserted page). */
+function evictCpuToFit(cache: MeshLoDCpuPageCache, protectId: number): void {
+    while (cache.usedBytes > cache.budgetBytes) {
+        let victimId = -1;
+        let victim: CpuCacheEntry | null = null;
+        for (const [id, entry] of cache.entries) {
+            if (entry.pinned || id === protectId) {
+                continue;
+            }
+            if (!victim || entry.lastUsed < victim.lastUsed || (entry.lastUsed === victim.lastUsed && id > victimId)) {
+                victim = entry;
+                victimId = id;
+            }
+        }
+        if (!victim) {
+            return;
+        }
+        cache.usedBytes -= victim.bytes.byteLength;
+        cache.entries.delete(victimId);
+    }
+}
+
+/** Retain a page's encoded bytes, then evict unpinned entries to fit the budget. The
+ *  just-inserted page is protected from this call's eviction. */
+export function putMeshLoDCpuPage(cache: MeshLoDCpuPageCache, pageId: number, bytes: Uint8Array, pinned: boolean, frame: number): void {
+    const existing = cache.entries.get(pageId);
+    if (existing) {
+        cache.usedBytes += bytes.byteLength - existing.bytes.byteLength;
+        existing.bytes = bytes;
+        existing.pinned = existing.pinned || pinned;
+        existing.lastUsed = frame;
+    } else {
+        cache.entries.set(pageId, { bytes, pinned, lastUsed: frame });
+        cache.usedBytes += bytes.byteLength;
+    }
+    evictCpuToFit(cache, pageId);
+}
+
+/** Return a retained page's encoded bytes (touching its last-used frame), or `null`. */
+export function getMeshLoDCpuPage(cache: MeshLoDCpuPageCache, pageId: number, frame: number): Uint8Array | null {
+    const entry = cache.entries.get(pageId);
+    if (!entry) {
+        return null;
+    }
+    entry.lastUsed = frame;
+    return entry.bytes;
+}
+
+/** Refresh a retained page's last-used frame without reading its bytes. */
+export function touchMeshLoDCpuPage(cache: MeshLoDCpuPageCache, pageId: number, frame: number): void {
+    const entry = cache.entries.get(pageId);
+    if (entry) {
+        entry.lastUsed = frame;
+    }
+}
+
+/** Apply a new CPU-cache byte budget and evict unpinned entries to fit. */
+export function setMeshLoDCpuCacheBudget(cache: MeshLoDCpuPageCache, budgetBytes: number): void {
+    cache.budgetBytes = budgetBytes;
+    evictCpuToFit(cache, -1);
 }

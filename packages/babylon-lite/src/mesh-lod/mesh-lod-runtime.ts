@@ -20,7 +20,17 @@ import { BOOTSTRAP_FIRST_END, concatBytes, createMeshLoDRangeSource, throwIfAbor
 import { createMeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDArena } from "./mesh-lod-cache.js";
-import { allocateArenaRun, arenaUsedBytes, createMeshLoDArena, floorToBlocks, pinnedAllocationBytes } from "./mesh-lod-cache.js";
+import type { MeshLoDCpuPageCache } from "./mesh-lod-cache.js";
+import {
+    allocateArenaRun,
+    arenaUsedBytes,
+    createMeshLoDArena,
+    createMeshLoDCpuPageCache,
+    cpuCacheUsedBytes,
+    floorToBlocks,
+    pinnedAllocationBytes,
+    putMeshLoDCpuPage,
+} from "./mesh-lod-cache.js";
 import { decodeMeshLoDPage, getMeshLoDPageDecoder } from "./mesh-lod-page-decoder.js";
 import { addMeshLoDInstanceToScene, removeMeshLoDInstanceFromScene } from "./mesh-lod-scene.js";
 import type { MeshLoDGpuAssetBuffers, MeshLoDGpuSelectedPair } from "./mesh-lod-selection-gpu.js";
@@ -180,8 +190,17 @@ export interface MeshLoDPageRuntime {
     arenaBytes: number;
     /** Byte offset of the page's vertex block within its decoded allocation. */
     readonly vertexByteOffset: number;
-    /** Decoded `u16` local indices retained for CPU expansion (pinned pages only). */
+    /** Decoded `u16` local indices retained for CPU expansion (pinned + resident fine
+     *  pages). */
     indices: Uint16Array | null;
+    /** Frame index this page was last referenced by selection, driving LRU age and the
+     *  120-frame residency hold. */
+    lastUsedFrame: number;
+    /** Latest demand priority, an eviction tie-break after LRU age. */
+    priority: number;
+    /** References by the current submitted frame's selection; a page with
+     *  `frameRefCount > 0` is never evicted (REQ-CACHE-3). */
+    frameRefCount: number;
     /** Terminal failure recorded for a pinned decode/upload error. */
     terminalError?: MeshLoDError;
 }
@@ -221,6 +240,9 @@ export interface MeshLoDAssetRuntime {
     /** Bounded fine-page request scheduler. Created by the streaming wiring on the
      *  first frame that demands a fine page; `null` until then and after disposal. */
     scheduler: MeshLoDRequestScheduler | null;
+    /** Retained encoded-page cache (pinned always retained; unpinned LRU-bounded to
+     *  `cpuPageCacheBytes`). Seeded with the pinned coarse pages at load. */
+    readonly cpuPageCache: MeshLoDCpuPageCache;
     readonly settings: MeshLoDEffectiveSettings;
     /** Live diagnostics object also referenced by `MeshLoDAsset.diagnostics`. */
     readonly diagnostics: MeshLoDDiagnostics;
@@ -302,6 +324,9 @@ async function prepareCoarseResidency(
         arenaBytes: 0,
         vertexByteOffset: record.vertexByteOffset,
         indices: null,
+        lastUsedFrame: 0,
+        priority: 0,
+        frameRefCount: 0,
     }));
 
     const decoder = await getMeshLoDPageDecoder();
@@ -390,6 +415,18 @@ export async function _loadMeshLoD(
     diagnostics.gpuCacheUsedBytes = arenaUsedBytes(gpu.arena);
     diagnostics.gpuCacheCapacityBytes = gpu.arena.capacityBytes;
     diagnostics.downloadedBytes = src.downloadedBytes;
+
+    // Retain the pinned coarse pages' encoded bytes so device recovery can re-decode
+    // without re-fetching; they always count toward the CPU-cache budget (§11.5).
+    const cpuPageCache = createMeshLoDCpuPageCache(settings.cpuPageCacheBytes);
+    for (let id = 0; id < parsed.pageRecords.length; id++) {
+        const record = parsed.pageRecords[id]!;
+        if (record.pinned) {
+            putMeshLoDCpuPage(cpuPageCache, id, coarseBytes.subarray(record.offset, record.offset + record.storedBytes).slice(), true, 0);
+        }
+    }
+    diagnostics.cpuPageCacheUsedBytes = cpuCacheUsedBytes(cpuPageCache);
+
     const runtime: MeshLoDAssetRuntime = {
         engine,
         source: src,
@@ -404,6 +441,7 @@ export async function _loadMeshLoD(
         gpu,
         gpuSelection: null,
         scheduler: null,
+        cpuPageCache,
         settings,
         diagnostics,
         abortController: new AbortController(),

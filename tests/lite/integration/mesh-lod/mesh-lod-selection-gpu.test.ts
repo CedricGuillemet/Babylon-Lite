@@ -272,7 +272,17 @@ describe("GPU selection model — bounded transient capacity", () => {
 });
 
 function fakeRuntime(h: FixtureHierarchy): MeshLoDAssetRuntime {
-    const pages = h.pageStoredBytes.map((_, id) => ({ id, state: "gpu-resident" as const, arenaOffset: id * 65536, arenaBytes: 65536, vertexByteOffset: 0, indices: null }));
+    const pages = h.pageStoredBytes.map((_, id) => ({
+        id,
+        state: "gpu-resident" as const,
+        arenaOffset: id * 65536,
+        arenaBytes: 65536,
+        vertexByteOffset: 0,
+        indices: null,
+        lastUsedFrame: 0,
+        priority: 0,
+        frameRefCount: 0,
+    }));
     return {
         hierarchyNodes: h.nodes.map(toNode),
         groups: h.groups.map(toGroup),

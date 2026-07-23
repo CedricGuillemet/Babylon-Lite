@@ -105,7 +105,7 @@ function makePageRecord(over: Partial<MeshLoDPageRecord> = {}): MeshLoDPageRecor
 }
 
 function makePageRuntime(over: Partial<MeshLoDPageRuntime> = {}): MeshLoDPageRuntime {
-    return { id: 0, state: "gpu-resident", arenaOffset: 131072, arenaBytes: 65536, vertexByteOffset: 0, indices: null, ...over };
+    return { id: 0, state: "gpu-resident", arenaOffset: 131072, arenaBytes: 65536, vertexByteOffset: 0, indices: null, lastUsedFrame: 0, priority: 0, frameRefCount: 0, ...over };
 }
 
 describe("MeshLoD GPU metadata layout", () => {
