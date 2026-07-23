@@ -200,6 +200,11 @@ async function main(): Promise<void> {
         cam.alpha = pose.alpha;
         cam.beta = pose.beta;
         cam.radius = pose.radius;
+        // Publish the live path pose so verification can detect path-driven motion
+        // (advancing) vs. a manual pause (frozen) without pixel comparison.
+        canvas.dataset.camAlpha = String(pose.alpha);
+        canvas.dataset.camBeta = String(pose.beta);
+        canvas.dataset.camRadius = String(pose.radius);
     };
     for (const event of ["pointerdown", "wheel", "touchstart"] as const) {
         canvas.addEventListener(event, () => cameraPath.notifyInteraction(), { passive: true });
