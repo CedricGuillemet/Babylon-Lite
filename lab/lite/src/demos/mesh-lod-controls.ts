@@ -25,6 +25,9 @@ export interface MeshLoDControlsOptions {
     assets: readonly MeshLoDAsset[];
     networkSim: MeshLoDNetworkSimulator;
     cameraPath: MeshLoDCameraPathController;
+    /** Called when the debug-view selector changes (demo updates the legend and
+     *  switches to CPU reference selection so all views render correctly). */
+    onDebugViewChange?: (view: MeshLoDDebugView) => void;
 }
 
 interface SliderSpec {
@@ -48,7 +51,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLEl
 }
 
 export function installMeshLoDControls(options: MeshLoDControlsOptions): void {
-    const { container, assets, networkSim, cameraPath } = options;
+    const { container, assets, networkSim, cameraPath, onDebugViewChange } = options;
     container.replaceChildren();
 
     const status = el("div", { className: "hud-status", role: "status" });
@@ -163,7 +166,13 @@ export function installMeshLoDControls(options: MeshLoDControlsOptions): void {
     for (const view of DEBUG_VIEWS) {
         debugSelect.append(el("option", { value: view.value, textContent: view.label }));
     }
-    debugSelect.addEventListener("change", () => runValidated(() => forEachAsset((a) => setMeshLoDDebugView(a, debugSelect.value as MeshLoDDebugView))));
+    debugSelect.addEventListener("change", () =>
+        runValidated(() => {
+            const view = debugSelect.value as MeshLoDDebugView;
+            forEachAsset((a) => setMeshLoDDebugView(a, view));
+            onDebugViewChange?.(view);
+        })
+    );
     const debugRow = el("div", { className: "hud-row" }, [el("label", { htmlFor: "mlod-debug" }, ["Debug view"]), debugSelect]);
 
     // Camera path: toggle + reset.
@@ -182,6 +191,53 @@ export function installMeshLoDControls(options: MeshLoDControlsOptions): void {
     syncPathToggle();
     const pathRow = el("div", { className: "hud-row hud-buttons" }, [pathToggle, pathReset]);
 
+    // Fallback scenarios: reproducible delayed / paused / unavailable / terminal
+    // conditions that keep the pinned coarse geometry rendering (REQ-DEMO-7). They
+    // drive the existing latency/pause controls (so the UI stays consistent) and the
+    // network simulator's fault injection.
+    const applyLatency = (ms: number): void => {
+        const s = document.getElementById("mlod-latency") as HTMLInputElement | null;
+        if (s) {
+            s.value = String(ms);
+            s.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+    };
+    const applyPause = (on: boolean): void => {
+        if (pause.checked !== on) {
+            pause.checked = on;
+            pause.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+    };
+    const scenarioButton = (id: string, label: string, apply: () => void): HTMLButtonElement => {
+        const button = el("button", { type: "button", id, textContent: label });
+        button.addEventListener("click", () => runValidated(apply));
+        return button;
+    };
+    const scenarioRow = el("div", { className: "hud-row hud-buttons hud-scenarios" }, [
+        scenarioButton("mlod-scn-delayed", "Delayed", () => {
+            networkSim.setFailureMode("none");
+            applyPause(false);
+            applyLatency(2000);
+        }),
+        scenarioButton("mlod-scn-paused", "Paused", () => {
+            networkSim.setFailureMode("none");
+            applyPause(true);
+        }),
+        scenarioButton("mlod-scn-offline", "Offline", () => {
+            applyPause(false);
+            networkSim.setFailureMode("unavailable");
+        }),
+        scenarioButton("mlod-scn-corrupt", "Corrupt", () => {
+            applyPause(false);
+            networkSim.setFailureMode("corrupt");
+        }),
+        scenarioButton("mlod-scn-reset", "Reset", () => {
+            networkSim.setFailureMode("none");
+            applyPause(false);
+            applyLatency(100);
+        }),
+    ]);
+
     container.append(
         el("div", { className: "hud-title", textContent: "MeshLoD controls" }),
         sseRow,
@@ -191,6 +247,8 @@ export function installMeshLoDControls(options: MeshLoDControlsOptions): void {
         pauseRow,
         debugRow,
         pathRow,
+        el("div", { className: "hud-sublabel", textContent: "Fallback scenarios" }),
+        scenarioRow,
         status
     );
 }

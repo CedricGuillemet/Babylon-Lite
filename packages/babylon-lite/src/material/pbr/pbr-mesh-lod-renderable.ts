@@ -40,11 +40,13 @@ import {
 } from "../../mesh-lod/mesh-lod-selection-gpu.js";
 import type { MeshLoDShaderFeatures } from "./pbr-mesh-lod-compose.js";
 import { composeMeshLoDWgsl, meshLoDShaderKey } from "./pbr-mesh-lod-compose.js";
+import { meshLoDClusterDebugAttr, meshLoDDebugModeCode, meshLoDPageRequestCode, meshLoDPageResidencyCode } from "./pbr-mesh-lod-debug.js";
 
 const DRAW_VERTEX_STRIDE = 16; // 4 × u32
 const INSTANCE_STRIDE = 128; // world mat4 (64) + 3 normal-matrix vec4 (48) + pad (16)
 const VERTEX_WORDS = 6; // 24-byte packed vertex / 4
 const MATERIAL_UBO_BYTES = 80; // 5 × vec4
+const MATERIAL_MISC_Y_BYTE = 68; // misc.y (data[17]) — debug-view mode selector
 
 // ─── Fallback textures (device-keyed lazy cache, no module-level allocation) ──
 
@@ -153,6 +155,8 @@ interface MeshLoDBatchPacket {
     /** Per-instance coarse expanded-vertex bound, for GPU draw-vertex buffer sizing. */
     readonly coarseVertices: number;
     lastVertexCount: number;
+    /** Debug-view mode (0 = off) last written into the material UBO's misc.y. */
+    appliedDebugMode: number;
     /** True once a disposed asset has re-recorded the cached bundle to drop its draw. */
     disposedHandled: boolean;
     // ── GPU selection/expansion path (created lazily on first GPU-mode frame) ──
@@ -300,11 +304,23 @@ function ensureCpuDrawCapacity(engine: EngineContext, batch: MeshLoDSceneBatch, 
     retireGpuResources(engine, () => oldBuffer.destroy());
 }
 
+/** Sync the debug-view mode into the material UBO's misc.y on change (a 4-byte
+ *  write). Observational only — never affects selection/residency/demand. */
+function syncDebugMode(engine: EngineContext, packet: MeshLoDBatchPacket, mode: number): void {
+    if (packet.appliedDebugMode === mode) {
+        return;
+    }
+    packet.appliedDebugMode = mode;
+    engine._device.queue.writeBuffer(packet.materialUbo, MATERIAL_MISC_Y_BYTE, new Float32Array([mode]));
+}
+
 /** Per-frame CPU selection + expansion (reference/diagnostic mode): run the oracle for
  *  each visible instance, write its world/normal matrices, and flatten selected pinned
  *  clusters into the draw-vertex stream, then publish the single indirect vertex count. */
 function updatePacketCpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, context: DrawUpdateContext): void {
     const runtime = batch.asset._runtime;
+    const debugMode = meshLoDDebugModeCode(runtime.debugView);
+    syncDebugMode(engine, packet, debugMode);
     const selections = selectMeshLoDBatch(batch, context);
     // Feed this frame's fine-page demand + frame references to the streaming engine.
     driveMeshLoDStreaming(batch, selections);
@@ -335,6 +351,16 @@ function updatePacketCpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet
             if (!page || page.state !== "gpu-resident" || !page.indices || page.arenaOffset < 0) {
                 continue;
             }
+            // Per-cluster debug attribute for the active view (0 when off). Purely
+            // observational — packed into the reserved draw-vertex word.
+            let debugAttr = 0;
+            if (debugMode !== 0) {
+                const record = runtime.pageRecords[cluster.pageId]!;
+                const depth = runtime.groups[cluster.groupId]?.depth ?? 0;
+                const residency = meshLoDPageResidencyCode(record.pinned, page.state);
+                const request = meshLoDPageRequestCode(record.pinned, page.state);
+                debugAttr = meshLoDClusterDebugAttr(debugMode, cluster.groupId, depth, residency, request);
+            }
             const arenaWordBase = (page.arenaOffset + page.vertexByteOffset) / 4;
             const indices = page.indices;
             const start = cluster.indexOffset;
@@ -349,7 +375,7 @@ function updatePacketCpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet
                 draw[o] = arenaWordBase + localVertex * VERTEX_WORDS;
                 draw[o + 1] = clusterId;
                 draw[o + 2] = localInstance;
-                draw[o + 3] = 0;
+                draw[o + 3] = debugAttr;
                 vertexCount++;
             }
         }
@@ -407,6 +433,7 @@ function updatePacketGpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet
         return;
     }
     const runtime = batch.asset._runtime;
+    syncDebugMode(engine, packet, meshLoDDebugModeCode(runtime.debugView));
     packet.gpuInstanceState ??= createMeshLoDGpuInstanceState(runtime.groups.length);
     packet.gpuBatchState ??= createMeshLoDGpuBatchState();
     const handles = queueMeshLoDGpuSelection(
@@ -505,6 +532,7 @@ export function buildMeshLoDBatchRenderable(engine: EngineContext, _scene: Scene
         maxInstances,
         coarseVertices,
         lastVertexCount: 0,
+        appliedDebugMode: 0,
         disposedHandled: false,
         gpuInstanceState: null,
         gpuBatchState: null,

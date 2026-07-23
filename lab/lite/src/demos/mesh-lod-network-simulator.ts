@@ -14,19 +14,27 @@
 export interface MeshLoDNetworkSettings {
     bandwidthBytesPerSecond: number;
     latencyMs: number;
+    failureMode: MeshLoDNetworkFailureMode;
 }
+
+/** Fault injection for `.mlod` traffic (for the demo's coarse-fallback scenarios):
+ *  `none` normal, `unavailable` rejects with a network error (retried → terminal),
+ *  `corrupt` returns integrity-invalid bytes (immediate terminal failure). */
+export type MeshLoDNetworkFailureMode = "none" | "unavailable" | "corrupt";
 
 export interface MeshLoDNetworkSimulator {
     /** A drop-in `fetch` to pass as `MeshLoDRequestOptions.fetch`. */
     readonly fetch: typeof fetch;
     setBandwidthBytesPerSecond(bytesPerSecond: number): void;
     setLatencyMs(latencyMs: number): void;
+    setFailureMode(mode: MeshLoDNetworkFailureMode): void;
     getSettings(): MeshLoDNetworkSettings;
 }
 
 export interface MeshLoDNetworkSimulatorOptions {
     bandwidthBytesPerSecond?: number;
     latencyMs?: number;
+    failureMode?: MeshLoDNetworkFailureMode;
     /** Async delay that MUST reject on abort. Defaults to a `setTimeout` clock;
      *  tests inject a controllable one. */
     wait?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -125,6 +133,7 @@ export function createMeshLoDNetworkSimulator(baseFetch: typeof fetch, options: 
     const settings: MeshLoDNetworkSettings = {
         bandwidthBytesPerSecond: options.bandwidthBytesPerSecond ?? Infinity,
         latencyMs: options.latencyMs ?? 0,
+        failureMode: options.failureMode ?? "none",
     };
     const wait = options.wait ?? defaultWait;
     const chunkBytes = options.chunkBytes ?? 65536;
@@ -136,11 +145,25 @@ export function createMeshLoDNetworkSimulator(baseFetch: typeof fetch, options: 
             return baseFetch(input, init);
         }
         const signal = requestSignal(input, init);
-        const { bandwidthBytesPerSecond, latencyMs } = settings;
+        const { bandwidthBytesPerSecond, latencyMs, failureMode } = settings;
         if (latencyMs > 0) {
             await wait(latencyMs, signal);
         }
+        if (failureMode === "unavailable") {
+            // A network-style error: retryable, so pages retry then terminally fail
+            // while the pinned coarse geometry keeps rendering.
+            throw new TypeError("MeshLoD network simulator: fine pages unavailable");
+        }
         const response = await baseFetch(input, init);
+        if (failureMode === "corrupt") {
+            // Flip a byte so the page's CRC/integrity check fails → immediate terminal
+            // failure (page-local), demonstrating the coarse fallback holds.
+            const buffer = new Uint8Array(await response.arrayBuffer());
+            if (buffer.length > 0) {
+                buffer[buffer.length >> 1] = buffer[buffer.length >> 1]! ^ 0xff;
+            }
+            return new Response(buffer, { status: response.status, statusText: response.statusText, headers: response.headers });
+        }
         if (!Number.isFinite(bandwidthBytesPerSecond) || !response.body) {
             return response;
         }
@@ -155,6 +178,9 @@ export function createMeshLoDNetworkSimulator(baseFetch: typeof fetch, options: 
         },
         setLatencyMs(latencyMs: number): void {
             settings.latencyMs = latencyMs;
+        },
+        setFailureMode(mode: MeshLoDNetworkFailureMode): void {
+            settings.failureMode = mode;
         },
         getSettings(): MeshLoDNetworkSettings {
             return { ...settings };

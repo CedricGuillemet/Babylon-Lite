@@ -52,6 +52,8 @@ struct VOut {
 @location(0) worldPos: vec3<f32>,
 @location(1) worldNormal: vec3<f32>,
 @location(2) uv: vec2<f32>,
+@location(3) @interpolate(flat) clusterId: u32,
+@location(4) @interpolate(flat) dbgAttr: u32,
 };`;
 
 const VERTEX_MAIN = `fn octSign(x: f32) -> f32 { return select(-1.0, 1.0, x >= 0.0); }
@@ -85,7 +87,48 @@ out.clipPos = scene.viewProjection * world4;
 let nmat = mat3x3<f32>(inst.n0.xyz, inst.n1.xyz, inst.n2.xyz);
 out.worldNormal = nmat * nrm;
 out.uv = uv;
+out.clusterId = rec.y;
+out.dbgAttr = rec.w;
 return out;
+}`;
+
+// Debug-view fragment output (architecture §15.5). `material.misc.y` selects the
+// mode (see pbr-mesh-lod-debug.ts::meshLoDDebugModeCode); the per-cluster attribute
+// arrives in the flat `dbgAttr` draw-vertex word. Keep these palettes in sync with
+// the demo legend. Observational only — never affects selection/residency/demand.
+const DEBUG_HELPERS = `fn mlodHash(x: u32) -> u32 {
+var h = (x + 1u) * 2654435761u;
+h = h ^ (h >> 15u);
+h = h * 2246822519u;
+h = h ^ (h >> 13u);
+return h;
+}
+fn mlodHashColor(id: u32) -> vec3<f32> {
+let h = mlodHash(id);
+let c = vec3<f32>(f32(h & 255u), f32((h >> 8u) & 255u), f32((h >> 16u) & 255u)) / 255.0;
+return mix(vec3<f32>(0.18), vec3<f32>(1.0), c);
+}
+fn mlodDepthColor(depth: u32) -> vec3<f32> {
+let t = clamp(f32(depth) / 11.0, 0.0, 1.0);
+return vec3<f32>(t, 1.0 - abs(t - 0.5) * 2.0, 1.0 - t);
+}
+fn mlodResidencyColor(code: u32) -> vec3<f32> {
+if (code == 1u) { return vec3<f32>(0.20, 0.90, 0.35); }
+if (code == 2u) { return vec3<f32>(0.95, 0.82, 0.20); }
+if (code == 3u) { return vec3<f32>(0.95, 0.22, 0.20); }
+return vec3<f32>(0.45, 0.45, 0.45);
+}
+fn mlodDebugColor(mode: u32, clusterId: u32, attr: u32) -> vec4<f32> {
+if (mode == 1u) { return vec4<f32>(mlodHashColor(clusterId), 1.0); }
+if (mode == 2u) { return vec4<f32>(mlodDepthColor(attr), 1.0); }
+if (mode == 3u) { return vec4<f32>(mlodHashColor(attr), 1.0); }
+if (mode == 4u) { return vec4<f32>(mlodResidencyColor(attr), 1.0); }
+if (mode == 5u) {
+if (attr == 1u) { return vec4<f32>(0.0, 0.85, 1.0, 1.0); }
+if (attr == 2u) { return vec4<f32>(1.0, 0.55, 0.0, 1.0); }
+return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+}
+return vec4<f32>(0.0, 0.0, 0.0, -1.0);
 }`;
 
 const PBR_HELPERS = `const PI: f32 = 3.14159265358979323846;
@@ -193,6 +236,10 @@ ${emissiveTex}
 var color = diffuseIbl + specIbl + directDiffuse + directSpecular + emissive;
 color = color * scene.vImageInfos.x;
 if (scene.vImageInfos.w >= 1.0) { color = vec3<f32>(1.0) - exp(-color); }
+// Debug-view override AFTER all texture sampling (textureSample requires uniform
+// control flow, so the non-uniform per-fragment debug branch must come last).
+let dbg = mlodDebugColor(u32(material.misc.y + 0.5), input.clusterId, input.dbgAttr);
+if (dbg.a >= 0.0) { return vec4<f32>(dbg.rgb, 1.0); }
 return vec4<f32>(color, 1.0);
 }`;
 }
@@ -201,13 +248,15 @@ function unlitFragment(): string {
     return `@fragment fn fs(input: VOut) -> @location(0) vec4<f32> {
 let baseSample = textureSample(baseColorTexture, baseColorSampler, input.uv);
 let color = baseSample.rgb * material.baseColorFactor.rgb;
+let dbg = mlodDebugColor(u32(material.misc.y + 0.5), input.clusterId, input.dbgAttr);
+if (dbg.a >= 0.0) { return vec4<f32>(dbg.rgb, 1.0); }
 return vec4<f32>(color, 1.0);
 }`;
 }
 
 /** Compose the full MeshLoD WGSL module (vertex `vs` + fragment `fs`) for a feature set. */
 export function composeMeshLoDWgsl(f: MeshLoDShaderFeatures): string {
-    const parts = [SCENE_UBO_WGSL, COMMON_DECLS, VERTEX_MAIN];
+    const parts = [SCENE_UBO_WGSL, COMMON_DECLS, VERTEX_MAIN, DEBUG_HELPERS];
     if (f.unlit) {
         parts.push(unlitFragment());
     } else {

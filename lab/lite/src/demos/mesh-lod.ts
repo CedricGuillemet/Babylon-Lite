@@ -32,8 +32,11 @@ import {
     onBeforeRender,
     registerScene,
     setCameraLimits,
+    setMeshLoDSelectionMode,
+    setRenderTaskGpuTimingEnabled,
     startEngine,
     type MeshLoDAsset,
+    type MeshLoDDebugView,
     type MeshLoDInstance,
     type PbrMaterialProps,
 } from "babylon-lite";
@@ -42,6 +45,7 @@ import { installFetchProgress } from "./loading-progress.js";
 import { createMeshLoDNetworkSimulator } from "./mesh-lod-network-simulator.js";
 import { createMeshLoDCameraPath, type MeshLoDCameraPose } from "./mesh-lod-camera-path.js";
 import { installMeshLoDControls } from "./mesh-lod-controls.js";
+import { installMeshLoDDiagnostics } from "./mesh-lod-diagnostics.js";
 
 // The three statue primitives, in mesh-index order (mesh000 → material 0, etc.).
 const MLOD_FILES = [
@@ -207,9 +211,33 @@ async function main(): Promise<void> {
         }
     });
 
+    // Opt into per-render-task GPU timing so the diagnostics panel can report a
+    // real duration (or an explicit "unsupported"/"pending" status — never a fake 0).
+    await setRenderTaskGpuTimingEnabled(engine, true);
+
+    // Live diagnostics + debug-view legend.
+    const diagnosticsContainer = document.getElementById("meshLodDiagnostics");
+    const legendContainer = document.getElementById("meshLodLegend");
+    const diagnostics =
+        diagnosticsContainer && legendContainer ? installMeshLoDDiagnostics({ container: diagnosticsContainer, legendContainer, engine, assets }) : null;
+
     const controlsContainer = document.getElementById("meshLodControls");
     if (controlsContainer) {
-        installMeshLoDControls({ container: controlsContainer, assets, networkSim, cameraPath });
+        installMeshLoDControls({
+            container: controlsContainer,
+            assets,
+            networkSim,
+            cameraPath,
+            onDebugViewChange: (view: MeshLoDDebugView) => {
+                diagnostics?.setLegend(view);
+                // Debug views render through the CPU reference selection path (which
+                // packs the per-cluster attribute); production GPU selection when off.
+                const mode = view === "none" ? "gpu" : "cpu";
+                for (const asset of assets) {
+                    setMeshLoDSelectionMode(asset, mode);
+                }
+            },
+        });
     }
 
     // `?pathTime=<seconds>` freezes the camera at a deterministic path pose for

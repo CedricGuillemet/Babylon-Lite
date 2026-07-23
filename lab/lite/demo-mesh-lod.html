@@ -92,6 +92,16 @@
     }
     .hud-buttons button:hover { background: rgba(224,104,75,0.34); }
     .hud-status:empty { display: none; }
+    .hud-metric { display: flex; justify-content: space-between; gap: 10px; margin: 2px 0; }
+    .hud-metric-label { color: #c9bdb8; }
+    .hud-note, .hud-sublabel { color: #b8a9a4; font-size: 0.66rem; }
+    .hud-note { margin-top: 6px; }
+    .hud-sublabel { margin-top: 9px; margin-bottom: 3px; font-weight: 600; letter-spacing: 0.02em; }
+    .hud-scenarios { flex-wrap: wrap; }
+    .hud-scenarios button { flex: 1 1 40%; }
+    .legend-item { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+    .legend-swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-block; border: 1px solid rgba(255,255,255,0.25); }
+    .legend-note { color: #c9bdb8; }
     @media (max-width: 720px) {
       .hud { font-size: 0.66rem; max-width: 92vw; }
       #meshLodControls, #meshLodDiagnostics { left: 8px; right: 8px; top: 8px; max-width: none; }
