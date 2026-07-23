@@ -29,6 +29,7 @@ import {
     loadEnvironment,
     loadGltf,
     loadMeshLoD,
+    onBeforeRender,
     registerScene,
     setCameraLimits,
     startEngine,
@@ -38,6 +39,9 @@ import {
 } from "babylon-lite";
 import { configureDemoDecoderBases, demoAssetUrl } from "./demo-asset-url.js";
 import { installFetchProgress } from "./loading-progress.js";
+import { createMeshLoDNetworkSimulator } from "./mesh-lod-network-simulator.js";
+import { createMeshLoDCameraPath, type MeshLoDCameraPose } from "./mesh-lod-camera-path.js";
+import { installMeshLoDControls } from "./mesh-lod-controls.js";
 
 // The three statue primitives, in mesh-index order (mesh000 → material 0, etc.).
 const MLOD_FILES = [
@@ -110,11 +114,14 @@ function computeStatueBounds(instances: readonly MeshLoDInstance[], assets: read
 async function main(): Promise<void> {
     const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
 
-    // Capture the pristine fetch BEFORE installing the loading-progress wrapper so
-    // MeshLoD's range traffic bypasses it (and, from T-35, routes through the
-    // network simulator instead). The progress bar then tracks the dominant
-    // downloads — the source GLB and the environment.
+    // Capture the pristine fetch BEFORE installing the loading-progress wrapper,
+    // then route MeshLoD's range traffic through the network simulator (which
+    // wraps the pristine fetch). This keeps MeshLoD traffic independent of the
+    // progress wrapper — which tracks the dominant downloads, the source GLB and
+    // the environment — and throttles ONLY `.mlod` requests. Defaults mirror
+    // architecture §15.3: 8 MiB/s, 100 ms latency, so streaming is observable.
     const rawFetch: typeof fetch = globalThis.fetch.bind(globalThis);
+    const networkSim = createMeshLoDNetworkSimulator(rawFetch, { bandwidthBytesPerSecond: 8 * 1024 * 1024, latencyMs: 100 });
     const progress = installFetchProgress(canvas, { estimatedBytes: 20_000_000 });
 
     const engine = await createEngine(canvas);
@@ -126,11 +133,11 @@ async function main(): Promise<void> {
     const base = meshLodBase(import.meta.url);
 
     // Load the source GLB (materials + transforms), the environment (IBL only),
-    // and the three streamed LOD primitives together. MeshLoD uses `rawFetch` so
-    // its range requests are independent of the progress wrapper.
+    // and the three streamed LOD primitives together. MeshLoD fetches through the
+    // network simulator so bandwidth/latency controls affect only `.mlod` traffic.
     const [container, assets] = await Promise.all([
         loadGltf(engine, demoAssetUrl(`./mesh-lod/${SOURCE_GLB}`, import.meta.url)),
-        Promise.all(MLOD_FILES.map((file) => loadMeshLoD(engine, `${base}${file}`, { request: { fetch: rawFetch } }))),
+        Promise.all(MLOD_FILES.map((file) => loadMeshLoD(engine, `${base}${file}`, { request: { fetch: networkSim.fetch } }))),
         loadEnvironment(scene, ENV_URL, {
             skipSkybox: true,
             skipGround: true,
@@ -178,6 +185,41 @@ async function main(): Promise<void> {
         },
         scene
     );
+
+    // Deterministic camera path + runtime controls. The path drives the camera on
+    // a fixed 60 Hz clock when enabled; any manual gesture pauses it (the user then
+    // orbits/zooms via attachControl), and reset returns it to t = 0.
+    const cameraPath = createMeshLoDCameraPath(bounds);
+    const applyPose = (pose: MeshLoDCameraPose): void => {
+        // The target is the constant aggregate-bounds center (set at creation);
+        // the path only orbits/zooms, so only alpha/beta/radius change per frame.
+        cam.alpha = pose.alpha;
+        cam.beta = pose.beta;
+        cam.radius = pose.radius;
+    };
+    for (const event of ["pointerdown", "wheel", "touchstart"] as const) {
+        canvas.addEventListener(event, () => cameraPath.notifyInteraction(), { passive: true });
+    }
+    onBeforeRender(scene, () => {
+        const pose = cameraPath.advance();
+        if (pose) {
+            applyPose(pose);
+        }
+    });
+
+    const controlsContainer = document.getElementById("meshLodControls");
+    if (controlsContainer) {
+        installMeshLoDControls({ container: controlsContainer, assets, networkSim, cameraPath });
+    }
+
+    // `?pathTime=<seconds>` freezes the camera at a deterministic path pose for
+    // repeatable capture/verification (mirrors the scenes' `?seekTime=`).
+    const pathTimeParam = new URLSearchParams(location.search).get("pathTime");
+    if (pathTimeParam !== null && Number.isFinite(Number(pathTimeParam))) {
+        cameraPath.freezeAt(Number(pathTimeParam));
+        applyPose(cameraPath.currentPose());
+        canvas.dataset.cameraPathFrozen = "true";
+    }
 
     await registerScene(scene);
     progress.done();

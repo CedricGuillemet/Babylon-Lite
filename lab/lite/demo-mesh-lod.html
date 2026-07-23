@@ -76,6 +76,22 @@
     #meshLodControls { top: 12px; left: 12px; }
     #meshLodDiagnostics { top: 12px; right: 12px; max-height: 88vh; overflow-y: auto; }
     #meshLodLegend { left: 12px; bottom: 40px; }
+    /* Control HUD widgets (built by mesh-lod-controls.ts). */
+    .hud-title { font-weight: 600; margin-bottom: 8px; letter-spacing: 0.02em; }
+    .hud-row { margin: 7px 0; }
+    .hud-row label { display: block; margin-bottom: 2px; color: #d8cdc9; }
+    .hud-row label.hud-inline { display: flex; align-items: center; gap: 6px; }
+    .hud-value { color: #f0b49c; font-weight: 600; }
+    .hud-row input[type="range"] { width: 100%; accent-color: #e0684b; }
+    .hud-row select { width: 100%; background: #1a1210; color: #eee6e3; border: 1px solid rgba(255,255,255,0.16); border-radius: 5px; padding: 3px 5px; font: inherit; }
+    .hud-buttons { display: flex; gap: 8px; }
+    .hud-buttons button {
+      flex: 1; cursor: pointer; font: inherit; color: #eee6e3;
+      background: rgba(224,104,75,0.18); border: 1px solid rgba(224,104,75,0.45);
+      border-radius: 5px; padding: 5px 8px;
+    }
+    .hud-buttons button:hover { background: rgba(224,104,75,0.34); }
+    .hud-status:empty { display: none; }
     @media (max-width: 720px) {
       .hud { font-size: 0.66rem; max-width: 92vw; }
       #meshLodControls, #meshLodDiagnostics { left: 8px; right: 8px; top: 8px; max-width: none; }
