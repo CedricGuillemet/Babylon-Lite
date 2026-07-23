@@ -1,0 +1,199 @@
+// Demo — MeshLoD Statue (streaming clustered level-of-detail)
+//
+// Showcase-only page. Streams the Harvard-Yenching Institute statue as three
+// `.mlod` clustered-LOD primitives through Babylon Lite's public, opt-in MeshLoD
+// path: `loadMeshLoD` → `createMeshLoDInstance` → `addMeshLoDToScene`. Selection,
+// streaming, caching, and material-owned indirect rendering are all the
+// production runtime — the demo adds no loader, selector, cache, or renderer of
+// its own.
+//
+// The source statue GLB is loaded ONLY to reuse its three existing PBR materials
+// (base-colour textures) and node transforms; its ordinary meshes are never added
+// to the scene, so nothing but the MeshLoD instances renders. This is a demo
+// asset-preparation compromise, not a MeshLoD runtime dependency — application
+// code can supply any supported `PbrMaterialProps` + transform without loading
+// glTF geometry.
+//
+// Model attribution (CC BY 4.0):
+//   "Harvard-Yenching Institute statue" by Alexandre Tokovinine
+//   (https://sketchfab.com/tokovinin3d), CC BY 4.0.
+
+import {
+    addMeshLoDToScene,
+    attachControl,
+    createArcRotateCamera,
+    createEngine,
+    createMeshLoDInstance,
+    createSceneContext,
+    getContainerMeshes,
+    loadEnvironment,
+    loadGltf,
+    loadMeshLoD,
+    registerScene,
+    setCameraLimits,
+    startEngine,
+    type MeshLoDAsset,
+    type MeshLoDInstance,
+    type PbrMaterialProps,
+} from "babylon-lite";
+import { configureDemoDecoderBases, demoAssetUrl } from "./demo-asset-url.js";
+import { installFetchProgress } from "./loading-progress.js";
+
+// The three statue primitives, in mesh-index order (mesh000 → material 0, etc.).
+const MLOD_FILES = [
+    "harvard-yenching_institute_statue.mesh000.prim000.mlod",
+    "harvard-yenching_institute_statue.mesh001.prim000.mlod",
+    "harvard-yenching_institute_statue.mesh002.prim000.mlod",
+];
+const SOURCE_GLB = "harvard-yenching_institute_statue.glb";
+const ENV_URL = "https://playground.babylonjs.com/textures/environment.env";
+
+const DEG = Math.PI / 180;
+
+/** Aggregate world-space bounds of the placed statue instances. */
+export interface StatueBounds {
+    center: { x: number; y: number; z: number };
+    radius: number;
+}
+
+/**
+ * Resolve the base URL for the `.mlod` (and source GLB) assets.
+ *
+ * In the lab dev server the demo bundle is served from `/lite/bundle/demos/`,
+ * while the committed assets under `lab/public/mesh-lod/` are served — WITH HTTP
+ * Range support (`206 Partial Content`) — from `/mesh-lod/`. MeshLoD streams via
+ * range requests, so dev must use that Range-capable public path. In the
+ * standalone deployed demo the assets are copied next to the bundle, so they
+ * resolve relative to this module.
+ */
+function meshLodBase(moduleUrl: string): string {
+    if (moduleUrl.includes("/lite/bundle/demos/")) {
+        return new URL("/mesh-lod/", moduleUrl).href;
+    }
+    return new URL("./mesh-lod/", moduleUrl).href;
+}
+
+/** Transform the 8 corners of every asset's local bounds by its instance world
+ *  matrix and union them into an aggregate world-space bounding sphere. */
+function computeStatueBounds(instances: readonly MeshLoDInstance[], assets: readonly MeshLoDAsset[]): StatueBounds {
+    let minX = Infinity,
+        minY = Infinity,
+        minZ = Infinity;
+    let maxX = -Infinity,
+        maxY = -Infinity,
+        maxZ = -Infinity;
+    for (let i = 0; i < instances.length; i++) {
+        const m = instances[i]!.worldMatrix;
+        const b = assets[i]!.metadata;
+        const lo = b.boundsMin;
+        const hi = b.boundsMax;
+        for (let c = 0; c < 8; c++) {
+            const x = c & 1 ? hi[0] : lo[0];
+            const y = c & 2 ? hi[1] : lo[1];
+            const z = c & 4 ? hi[2] : lo[2];
+            const wx = m[0]! * x + m[4]! * y + m[8]! * z + m[12]!;
+            const wy = m[1]! * x + m[5]! * y + m[9]! * z + m[13]!;
+            const wz = m[2]! * x + m[6]! * y + m[10]! * z + m[14]!;
+            minX = Math.min(minX, wx);
+            minY = Math.min(minY, wy);
+            minZ = Math.min(minZ, wz);
+            maxX = Math.max(maxX, wx);
+            maxY = Math.max(maxY, wy);
+            maxZ = Math.max(maxZ, wz);
+        }
+    }
+    const center = { x: (minX + maxX) / 2, y: (minY + maxY) / 2, z: (minZ + maxZ) / 2 };
+    const radius = 0.5 * Math.hypot(maxX - minX, maxY - minY, maxZ - minZ);
+    return { center, radius: radius > 0 && Number.isFinite(radius) ? radius : 1 };
+}
+
+async function main(): Promise<void> {
+    const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
+
+    // Capture the pristine fetch BEFORE installing the loading-progress wrapper so
+    // MeshLoD's range traffic bypasses it (and, from T-35, routes through the
+    // network simulator instead). The progress bar then tracks the dominant
+    // downloads — the source GLB and the environment.
+    const rawFetch: typeof fetch = globalThis.fetch.bind(globalThis);
+    const progress = installFetchProgress(canvas, { estimatedBytes: 20_000_000 });
+
+    const engine = await createEngine(canvas);
+    const scene = createSceneContext(engine);
+    scene.clearColor = { r: 0.043, g: 0.035, b: 0.043, a: 1 };
+
+    await configureDemoDecoderBases(import.meta.url);
+
+    const base = meshLodBase(import.meta.url);
+
+    // Load the source GLB (materials + transforms), the environment (IBL only),
+    // and the three streamed LOD primitives together. MeshLoD uses `rawFetch` so
+    // its range requests are independent of the progress wrapper.
+    const [container, assets] = await Promise.all([
+        loadGltf(engine, demoAssetUrl(`./mesh-lod/${SOURCE_GLB}`, import.meta.url)),
+        Promise.all(MLOD_FILES.map((file) => loadMeshLoD(engine, `${base}${file}`, { request: { fetch: rawFetch } }))),
+        loadEnvironment(scene, ENV_URL, {
+            skipSkybox: true,
+            skipGround: true,
+            brdfUrl: demoAssetUrl("./brdf-lut.png", import.meta.url),
+        }),
+    ]);
+
+    // Reuse the GLB's PBR materials + node transforms. The ordinary source meshes
+    // are NOT added to the scene, so only the MeshLoD instances render.
+    const meshes = getContainerMeshes(container);
+    const instances: MeshLoDInstance[] = [];
+    for (let i = 0; i < assets.length; i++) {
+        const asset = assets[i]!;
+        const source = meshes[asset.metadata.meshIndex] ?? meshes[i];
+        if (!source) {
+            throw new Error(`Missing source mesh for MeshLoD primitive ${i}`);
+        }
+        const instance = createMeshLoDInstance(asset, source.material as unknown as PbrMaterialProps, { name: `statue-prim-${i}` });
+        // Borrow the source mesh's exact world transform (its glTF node chain);
+        // the source mesh itself is never registered, so it never renders.
+        instance.parent = source;
+        addMeshLoDToScene(scene, instance);
+        instances.push(instance);
+    }
+
+    // Lift the exposure above loadEnvironment's default (0.8) so the marble reads
+    // brightly against the dark background.
+    scene.imageProcessing.exposure = 1.15;
+
+    // Frame the camera from the aggregate world bounds. The default pose is an
+    // establishing 3/4 view; the deterministic camera path (when enabled) drives
+    // its own azimuth/elevation/radius from the same bounds.
+    const bounds = computeStatueBounds(instances, assets);
+    const cam = createArcRotateCamera(-0.8 * Math.PI, 58 * DEG, bounds.radius * 1.85, bounds.center);
+    cam.fov = 0.8;
+    cam.nearPlane = Math.max(bounds.radius * 0.01, 0.01);
+    cam.farPlane = bounds.radius * 100;
+    scene.camera = cam;
+    attachControl(cam, canvas, scene);
+    setCameraLimits(
+        cam,
+        {
+            lowerRadiusLimit: bounds.radius * 0.35,
+            upperRadiusLimit: bounds.radius * 4,
+        },
+        scene
+    );
+
+    await registerScene(scene);
+    progress.done();
+    await startEngine(engine);
+
+    canvas.dataset.sourceTriangles = String(assets.reduce((sum, a) => sum + a.metadata.sourceTriangleCount, 0));
+    canvas.dataset.instanceCount = String(instances.length);
+    canvas.dataset.camAlpha = String(cam.alpha);
+    canvas.dataset.camBeta = String(cam.beta);
+    canvas.dataset.camRadius = String(cam.radius);
+    canvas.dataset.ready = "true";
+}
+
+main().catch((err: unknown) => {
+    console.error(err);
+    const canvas = document.getElementById("renderCanvas");
+    const message = err instanceof Error ? err.message : String(err);
+    canvas?.setAttribute("data-error", message || "true");
+});

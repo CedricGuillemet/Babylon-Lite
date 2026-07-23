@@ -50,6 +50,8 @@ const LITTLEST_TOKYO_SRC = resolve(labDir, "public/littlest-tokyo");
 const TETRIS_SRC = resolve(labDir, "public/tetris");
 const PLATFORMER_SRC = resolve(labDir, "public/platformer");
 const SANDBLOX_SRC = resolve(labDir, "public/sandblox");
+const MESH_LOD_SRC = resolve(labDir, "public/mesh-lod");
+const MESH_LOD_SOURCE_GLB = resolve(ROOT, "harvard-yenching_institute_statue.glb");
 const DRACO_FILES = ["draco_decoder.js", "draco_decoder.wasm"];
 
 const _demoRequire = createRequire(import.meta.url);
@@ -239,6 +241,19 @@ function copyDemoRuntimeAssets(demos: DemoConfigEntry[]): void {
     if (demos.some((demo) => demo.slug === "sandblox")) {
         // Default world map JSON, fetched at runtime via demoAssetUrl.
         copyRequiredDir(SANDBLOX_SRC, resolve(demosDir, "sandblox"), "Sandblox");
+    }
+
+    if (demos.some((demo) => demo.slug === "mesh-lod")) {
+        // The three committed `.mlod` primitives (+ stats) and the repository-root
+        // source GLB the demo loads for its materials/transforms, copied flat under
+        // the demo's own subpath so the standalone site (which serves ONLY
+        // lab/public/bundle/demos/) resolves them via demoAssetUrl("./mesh-lod/…").
+        const meshLodOut = resolve(demosDir, "mesh-lod");
+        copyRequiredDir(MESH_LOD_SRC, meshLodOut, "MeshLoD");
+        if (!existsSync(MESH_LOD_SOURCE_GLB)) {
+            throw new Error(`Missing MeshLoD source GLB at ${MESH_LOD_SOURCE_GLB}`);
+        }
+        cpSync(MESH_LOD_SOURCE_GLB, resolve(meshLodOut, "harvard-yenching_institute_statue.glb"));
     }
 
     if (demos.some((demo) => demo.slug === "bath-day")) {
