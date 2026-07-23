@@ -17,6 +17,7 @@ import {
     cpuCacheUsedBytes,
     createMeshLoDArena,
     createMeshLoDCpuPageCache,
+    evictMeshLoDToBudget,
     getMeshLoDCpuPage,
     putMeshLoDCpuPage,
     reserveMeshLoDArenaRun,
@@ -186,6 +187,46 @@ describe("MeshLoD GPU cache — reservation & eviction", () => {
         expect(offset).not.toBeNull();
         expect(evicted).toEqual([]);
         expect(arenaUsedBytes(f.arena)).toBe(3 * BLOCK);
+    });
+});
+
+describe("MeshLoD GPU cache — trim to a reduced budget", () => {
+    it("evicts eligible victims until committed residency fits a lowered budget", () => {
+        const f = buildFixture(10, [
+            { blocks: 1, pinned: true },
+            { blocks: 1, lastUsedFrame: 10 },
+            { blocks: 1, lastUsedFrame: 20 },
+            { blocks: 1, lastUsedFrame: 30 },
+        ]);
+        expect(arenaUsedBytes(f.arena)).toBe(4 * BLOCK);
+        const evicted: number[] = [];
+        evictMeshLoDToBudget(f.arena, f.pages, f.records, policy(300, 2), evicted); // budget = 2 blocks
+        expect(arenaUsedBytes(f.arena)).toBeLessThanOrEqual(2 * BLOCK);
+        expect(evicted).toEqual([1, 2]); // oldest two unpinned pages, pinned untouched
+        expect(f.pages[0]!.state).toBe("gpu-resident");
+    });
+
+    it("stops at the protected floor, never evicting pinned or held pages below budget", () => {
+        const f = buildFixture(10, [
+            { blocks: 2, pinned: true },
+            { blocks: 1, lastUsedFrame: 10, frameRefCount: 1 }, // referenced this frame
+        ]);
+        const evicted: number[] = [];
+        evictMeshLoDToBudget(f.arena, f.pages, f.records, policy(300, 1), evicted); // budget below committed
+        // Neither the pinned page nor the current-frame page is evictable, so the trim halts.
+        expect(evicted).toEqual([]);
+        expect(arenaUsedBytes(f.arena)).toBe(3 * BLOCK);
+    });
+
+    it("is a no-op when committed residency already fits the budget", () => {
+        const f = buildFixture(10, [
+            { blocks: 1, pinned: true },
+            { blocks: 1, lastUsedFrame: 10 },
+        ]);
+        const evicted: number[] = [];
+        evictMeshLoDToBudget(f.arena, f.pages, f.records, policy(300, 8), evicted);
+        expect(evicted).toEqual([]);
+        expect(arenaUsedBytes(f.arena)).toBe(2 * BLOCK);
     });
 });
 
