@@ -24,6 +24,7 @@ import { allocateArenaRun, arenaUsedBytes, createMeshLoDArena, floorToBlocks, pi
 import { decodeMeshLoDPage, getMeshLoDPageDecoder } from "./mesh-lod-page-decoder.js";
 import { addMeshLoDInstanceToScene, removeMeshLoDInstanceFromScene } from "./mesh-lod-scene.js";
 import type { MeshLoDGpuAssetBuffers, MeshLoDGpuSelectedPair } from "./mesh-lod-selection-gpu.js";
+import type { MeshLoDRequestScheduler } from "./mesh-lod-scheduler.js";
 /** Effective, fully-resolved runtime settings (defaults applied, values validated). */
 export interface MeshLoDEffectiveSettings {
     screenSpaceError: number;
@@ -157,10 +158,15 @@ export interface MeshLoDPageRecord {
     readonly maxDepth: number;
 }
 
-/** Runtime state of one page. Phase 4 only reaches the pinned-page states
- *  (`gpu-resident` for pinned pages, `unrequested` for fine pages); the fetching /
- *  decoding / evicting transitions are added by the streaming tasks. */
-export type MeshLoDPageState = "unrequested" | "cpu-resident" | "gpu-resident" | "terminal-failed" | "disposed";
+/** Runtime residency state of one page (architecture §11.3). Pinned pages reach
+ *  gpu-resident at bootstrap; fine pages walk unrequested → queued → fetching →
+ *  retry-wait → received → decoding → cpu-resident → uploading → gpu-resident, and a
+ *  resident fine page may later evict back to unrequested. A terminal fine failure is
+ *  page-local (terminal-failed); a pinned failure fails initialization. The scheduler
+ *  owns the request-side states (queued/fetching/retry-wait); the runtime owns the
+ *  residency-side states. */
+export type MeshLoDPageState =
+    "unrequested" | "queued" | "fetching" | "retry-wait" | "received" | "decoding" | "cpu-resident" | "uploading" | "gpu-resident" | "evicting" | "terminal-failed" | "disposed";
 
 /** Per-page mutable runtime record. Pinned pages retain their decoded local
  *  indices so the CPU selection/expansion path can build the coarse draw stream
@@ -212,6 +218,9 @@ export interface MeshLoDAssetRuntime {
     /** Shared per-asset GPU selection buffers (immutable hierarchy + mutable page state).
      *  Built lazily on the first GPU selection; `null` until then and after device change. */
     gpuSelection: MeshLoDGpuAssetBuffers | null;
+    /** Bounded fine-page request scheduler. Created by the streaming wiring on the
+     *  first frame that demands a fine page; `null` until then and after disposal. */
+    scheduler: MeshLoDRequestScheduler | null;
     readonly settings: MeshLoDEffectiveSettings;
     /** Live diagnostics object also referenced by `MeshLoDAsset.diagnostics`. */
     readonly diagnostics: MeshLoDDiagnostics;
@@ -394,6 +403,7 @@ export async function _loadMeshLoD(
         groupPageRefs: parsed.groupPageRefs,
         gpu,
         gpuSelection: null,
+        scheduler: null,
         settings,
         diagnostics,
         abortController: new AbortController(),
