@@ -317,7 +317,8 @@ export function setMeshLoDScreenSpaceError(asset: MeshLoDAsset, pixels: number):
 }
 
 /** Set the effective GPU residency budget (bytes). Must not exceed the immutable
- *  arena capacity chosen at load. */
+ *  arena capacity chosen at load. Takes effect on the next streaming step, which trims
+ *  resident fine pages down to the new budget and gates further uploads. */
 export function setMeshLoDCacheBudget(asset: MeshLoDAsset, bytes: number): void {
     if (!Number.isFinite(bytes) || bytes <= 0) {
         throw invalidOption("cacheBudgetBytes", "a finite number > 0", bytes);
@@ -326,11 +327,15 @@ export function setMeshLoDCacheBudget(asset: MeshLoDAsset, bytes: number): void 
         throw invalidOption("cacheBudgetBytes", "<= cacheCapacityBytes", bytes);
     }
     asset._runtime.settings.cacheBudgetBytes = bytes;
+    (asset.diagnostics as { gpuCacheBudgetBytes: number }).gpuCacheBudgetBytes = bytes;
 }
 
-/** Pause or resume fine-page streaming. Coarse rendering is unaffected. */
+/** Pause or resume fine-page streaming. Coarse rendering, resident geometry, and the
+ *  coarse fallback are unaffected; pausing only suppresses new fine requests and
+ *  retries. Resuming pumps queued work on the next streaming step. */
 export function setMeshLoDStreamingPaused(asset: MeshLoDAsset, paused: boolean): void {
     asset._runtime.streamingPaused = paused;
+    (asset.diagnostics as { streamingPaused: boolean }).streamingPaused = paused;
 }
 
 /** Select a diagnostic debug view (or `"none"`). */
@@ -358,6 +363,7 @@ export function disposeMeshLoDAsset(asset: MeshLoDAsset): void {
     runtime.disposed = true;
     runtime.generation += 1;
     runtime.abortController.abort();
+    _runtimeModule?._disposeMeshLoDScheduler(runtime);
     runtime.gpu?.arena.buffer.destroy?.();
     const sel = runtime.gpuSelection;
     if (sel) {

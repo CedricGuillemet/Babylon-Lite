@@ -19,22 +19,29 @@ import { parseMeshLoDContainer, readBootstrapExtent, toMeshLoDMetadata } from ".
 import { BOOTSTRAP_FIRST_END, concatBytes, createMeshLoDRangeSource, throwIfAborted } from "./mesh-lod-range-source.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDError } from "./mesh-lod-errors.js";
-import type { MeshLoDArena } from "./mesh-lod-cache.js";
-import type { MeshLoDCpuPageCache } from "./mesh-lod-cache.js";
+import type { MeshLoDArena, MeshLoDCpuPageCache, MeshLoDEvictionPolicy } from "./mesh-lod-cache.js";
 import {
     allocateArenaRun,
     arenaUsedBytes,
     createMeshLoDArena,
     createMeshLoDCpuPageCache,
     cpuCacheUsedBytes,
+    evictMeshLoDToBudget,
     floorToBlocks,
+    getMeshLoDCpuPage,
     pinnedAllocationBytes,
     putMeshLoDCpuPage,
+    reserveMeshLoDArenaRun,
+    setMeshLoDCpuCacheBudget,
 } from "./mesh-lod-cache.js";
 import { decodeMeshLoDPage, getMeshLoDPageDecoder } from "./mesh-lod-page-decoder.js";
+import type { DecodedMeshLoDPage } from "./mesh-lod-page-decoder.js";
+import type { MeshoptDecoderModule } from "../loader-gltf/meshopt-decode.js";
 import { addMeshLoDInstanceToScene, removeMeshLoDInstanceFromScene } from "./mesh-lod-scene.js";
 import type { MeshLoDGpuAssetBuffers, MeshLoDGpuSelectedPair } from "./mesh-lod-selection-gpu.js";
-import type { MeshLoDRequestScheduler } from "./mesh-lod-scheduler.js";
+import type { MeshLoDPageDemand, MeshLoDRequestScheduler, MeshLoDSchedulerTimers } from "./mesh-lod-scheduler.js";
+import { createMeshLoDRequestScheduler, disposeMeshLoDRequestScheduler, schedulerQueuedCount, setMeshLoDSchedulerConcurrency, submitMeshLoDDemand } from "./mesh-lod-scheduler.js";
+import { retireGpuResources } from "../engine/gpu-resource-retirement.js";
 /** Effective, fully-resolved runtime settings (defaults applied, values validated). */
 export interface MeshLoDEffectiveSettings {
     screenSpaceError: number;
@@ -240,6 +247,12 @@ export interface MeshLoDAssetRuntime {
     /** Bounded fine-page request scheduler. Created by the streaming wiring on the
      *  first frame that demands a fine page; `null` until then and after disposal. */
     scheduler: MeshLoDRequestScheduler | null;
+    /** @internal Injected scheduler timers for deterministic streaming fixtures. When
+     *  `null` the scheduler uses wall-clock `setTimeout` for retry delays. */
+    _schedulerTimers: MeshLoDSchedulerTimers | null;
+    /** The shared meshopt decoder resolved at load; reused to decode streamed fine
+     *  pages synchronously from the scheduler completion callback. */
+    readonly decoderModule: MeshoptDecoderModule;
     /** Retained encoded-page cache (pinned always retained; unpinned LRU-bounded to
      *  `cpuPageCacheBytes`). Seeded with the pinned coarse pages at load. */
     readonly cpuPageCache: MeshLoDCpuPageCache;
@@ -427,6 +440,10 @@ export async function _loadMeshLoD(
     }
     diagnostics.cpuPageCacheUsedBytes = cpuCacheUsedBytes(cpuPageCache);
 
+    // The coarse decoder is already resolved (prepareCoarseResidency awaited it and it
+    // is a cached singleton); retain it to decode streamed fine pages synchronously.
+    const decoderModule = await getMeshLoDPageDecoder();
+
     const runtime: MeshLoDAssetRuntime = {
         engine,
         source: src,
@@ -441,6 +458,8 @@ export async function _loadMeshLoD(
         gpu,
         gpuSelection: null,
         scheduler: null,
+        _schedulerTimers: null,
+        decoderModule,
         cpuPageCache,
         settings,
         diagnostics,
@@ -488,4 +507,250 @@ export function _normalizeMeshLoDSelectedClusterIds(pairs: readonly MeshLoDGpuSe
  *  registry module). */
 export function _removeMeshLoDFromScene(scene: SceneContext, instance: MeshLoDInstance): void {
     removeMeshLoDInstanceFromScene(scene, instance);
+}
+
+// ─── Streaming residency engine (architecture §11) ───────────────────
+
+/** Per-frame selection diagnostics published by the scene into the live snapshot.
+ *  (Rendered-triangle and selected-meshlet counts stay owned by the material renderable,
+ *  which knows the post-capacity-clamp totals.) */
+export interface MeshLoDStreamSelectionStats {
+    readonly visibleGroupCount: number;
+    readonly fallbackGroupCount: number;
+    readonly maximumSelectedErrorPixels: number;
+    readonly maximumUnmetErrorPixels: number;
+}
+
+/** Inclusive end byte of a page's stored range within the container. */
+function pageByteEnd(record: MeshLoDPageRecord): number {
+    return record.offset + record.storedBytes - 1;
+}
+
+/** Fetch one fine page's encoded bytes. A retained encoded copy (CPU cache) short-
+ *  circuits the network for an evicted-then-re-demanded page (§11.5); otherwise the
+ *  range source reads exactly its stored bytes. */
+function fetchStreamedPage(runtime: MeshLoDAssetRuntime, pageId: number, signal: AbortSignal): Promise<Uint8Array> {
+    const cached = getMeshLoDCpuPage(runtime.cpuPageCache, pageId, runtime.frameIndex);
+    if (cached) {
+        return Promise.resolve(cached);
+    }
+    const record = runtime.pageRecords[pageId]!;
+    return runtime.source.read(record.offset, pageByteEnd(record), signal);
+}
+
+/** Lazily create the fine-page scheduler bound to this asset's runtime. Decode, cache,
+ *  reservation, upload, and residency commit stay runtime-owned via the callbacks. */
+function ensureMeshLoDScheduler(runtime: MeshLoDAssetRuntime): MeshLoDRequestScheduler {
+    if (runtime.scheduler) {
+        return runtime.scheduler;
+    }
+    const scheduler = createMeshLoDRequestScheduler({
+        maxConcurrentRequests: runtime.settings.maxConcurrentRequests,
+        retryCount: runtime.settings.retryCount,
+        retryDelaysMs: runtime.settings.retryDelaysMs,
+        obsoleteRequestGraceFrames: runtime.settings.obsoleteRequestGraceFrames,
+        callbacks: {
+            fetchPage: (pageId, signal) => fetchStreamedPage(runtime, pageId, signal),
+            onPageReceived: (pageId, bytes) => commitStreamedPage(runtime, pageId, bytes),
+            onPageFailed: (pageId, error) => failStreamedPage(runtime, pageId, error),
+            currentGeneration: () => runtime.generation,
+            isPaused: () => runtime.streamingPaused,
+        },
+        timers: runtime._schedulerTimers ?? undefined,
+    });
+    runtime.scheduler = scheduler;
+    return scheduler;
+}
+
+/** Commit a fresh, non-stale fetched fine page: validate + decode, retain its encoded
+ *  bytes, reserve a decoded arena run (evicting eligible victims), upload, and mark it
+ *  GPU-resident. A decode/integrity failure is page-local (terminal-failed). If no run
+ *  fits without evicting protected pages the page stays unrequested for a later frame,
+ *  its encoded bytes retained. */
+function commitStreamedPage(runtime: MeshLoDAssetRuntime, pageId: number, bytes: Uint8Array): void {
+    const record = runtime.pageRecords[pageId]!;
+    const page = runtime.gpu.pages[pageId]!;
+    // Retain the encoded bytes (unpinned, LRU-bounded) so device recovery / re-demand
+    // can decode without re-fetching (§11.5).
+    putMeshLoDCpuPage(runtime.cpuPageCache, pageId, bytes.slice(), record.pinned, runtime.frameIndex);
+
+    page.state = "decoding";
+    let decoded: DecodedMeshLoDPage;
+    try {
+        decoded = decodeMeshLoDPage(bytes, record, runtime.decoderModule);
+    } catch (cause) {
+        failStreamedPage(runtime, pageId, cause as MeshLoDError);
+        return;
+    }
+    page.state = "cpu-resident";
+
+    const policy: MeshLoDEvictionPolicy = {
+        budgetBytes: floorToBlocks(runtime.settings.cacheBudgetBytes),
+        currentFrame: runtime.frameIndex,
+        residencyHoldFrames: runtime.settings.residencyHoldFrames,
+    };
+    const evicted: number[] = [];
+    const offset = reserveMeshLoDArenaRun(runtime.gpu.arena, runtime.gpu.pages, runtime.pageRecords, record.decodedBytes, policy, evicted);
+    applyStreamedEvictions(runtime, evicted);
+    if (offset === null) {
+        // No run fits without evicting protected pages; re-demand on a later frame.
+        page.state = "unrequested";
+        refreshMeshLoDStreamingDiagnostics(runtime);
+        return;
+    }
+
+    page.state = "uploading";
+    const arena = runtime.gpu.arena;
+    runtime.engine._device.queue.writeBuffer(arena.buffer, offset, decoded.decoded.buffer as ArrayBuffer, decoded.decoded.byteOffset, decoded.decoded.byteLength);
+    page.arenaOffset = offset;
+    page.arenaBytes = record.decodedBytes;
+    // Retain only the decoded local indices for CPU expansion; the decoded vertex bytes
+    // are released after upload (§11.5).
+    page.indices = new Uint16Array(decoded.decoded.buffer, decoded.decoded.byteOffset + record.indexByteOffset, record.localIndexCount).slice();
+    page.lastUsedFrame = runtime.frameIndex;
+    page.state = "gpu-resident";
+    runtime.gpu.residentPageCount++;
+    refreshMeshLoDStreamingDiagnostics(runtime);
+}
+
+/** Record a page-local terminal fine failure (never fails the coarse asset). A page
+ *  that already reached residency ignores a late failure. */
+function failStreamedPage(runtime: MeshLoDAssetRuntime, pageId: number, error: MeshLoDError): void {
+    const page = runtime.gpu.pages[pageId]!;
+    if (page.state === "gpu-resident") {
+        return;
+    }
+    page.state = "terminal-failed";
+    page.terminalError = error;
+    refreshMeshLoDStreamingDiagnostics(runtime);
+}
+
+/** Account evicted pages: each was reset to `unrequested` by the cache; drop the
+ *  resident count. Encoded bytes stay retained in the CPU cache for re-demand. */
+function applyStreamedEvictions(runtime: MeshLoDAssetRuntime, evicted: readonly number[]): void {
+    for (let i = 0; i < evicted.length; i++) {
+        if (runtime.gpu.residentPageCount > 0) {
+            runtime.gpu.residentPageCount--;
+        }
+    }
+}
+
+function countTerminalFailedPages(runtime: MeshLoDAssetRuntime): number {
+    let count = 0;
+    for (const page of runtime.gpu.pages) {
+        if (page.state === "terminal-failed") {
+            count++;
+        }
+    }
+    return count;
+}
+
+/** Refresh the live diagnostics counters that streaming and residency own. */
+function refreshMeshLoDStreamingDiagnostics(runtime: MeshLoDAssetRuntime): void {
+    const d = runtime.diagnostics as MeshLoDMutableDiagnostics;
+    const scheduler = runtime.scheduler;
+    d.requestedPageCount = scheduler ? scheduler.requests.size : 0;
+    d.queuedPageCount = scheduler ? schedulerQueuedCount(scheduler) : 0;
+    d.inFlightPageCount = scheduler ? scheduler.inFlightCount : 0;
+    d.residentPageCount = runtime.gpu.residentPageCount;
+    d.terminalFailedPageCount = countTerminalFailedPages(runtime);
+    d.downloadedBytes = runtime.source.downloadedBytes;
+    d.gpuCacheUsedBytes = arenaUsedBytes(runtime.gpu.arena);
+    d.gpuCacheBudgetBytes = runtime.settings.cacheBudgetBytes;
+    d.cpuPageCacheUsedBytes = cpuCacheUsedBytes(runtime.cpuPageCache);
+    d.maxConcurrentRequests = scheduler ? scheduler.maxConcurrentRequests : runtime.settings.maxConcurrentRequests;
+    d.streamingPaused = runtime.streamingPaused;
+    d.selectionMode = runtime.selectionMode;
+}
+
+/** @internal Drive one frame of fine-page streaming for an asset. Advances the frame
+ *  counter, applies pending control changes (concurrency, CPU-cache budget), holds a
+ *  frame reference on every page a rendered cluster used (released after the frame is
+ *  submitted, per §14.1), feeds generation-stamped demand to the scheduler, trims
+ *  residency to the effective GPU budget, and refreshes diagnostics. Called by the
+ *  scene each frame with the aggregated per-instance page demand and referenced pages. */
+export function stepMeshLoDStreaming(
+    runtime: MeshLoDAssetRuntime,
+    demand: readonly MeshLoDPageDemand[],
+    referencedPages: readonly number[],
+    selectionStats?: MeshLoDStreamSelectionStats
+): void {
+    if (runtime.disposed) {
+        return;
+    }
+    const frame = ++runtime.frameIndex;
+
+    // Apply control changes that may have arrived via the public setters since the
+    // previous frame.
+    setMeshLoDCpuCacheBudget(runtime.cpuPageCache, runtime.settings.cpuPageCacheBytes);
+    if (runtime.scheduler) {
+        setMeshLoDSchedulerConcurrency(runtime.scheduler, runtime.settings.maxConcurrentRequests);
+    }
+
+    // Frame references: a page that contributed a rendered cluster is protected from
+    // eviction until this frame's command buffer has been submitted (§14.1).
+    if (referencedPages.length > 0) {
+        const held: number[] = [];
+        for (const id of referencedPages) {
+            const page = runtime.gpu.pages[id];
+            if (!page) {
+                continue;
+            }
+            page.frameRefCount++;
+            page.lastUsedFrame = frame;
+            held.push(id);
+        }
+        if (held.length > 0) {
+            retireGpuResources(runtime.engine, () => {
+                for (const id of held) {
+                    const page = runtime.gpu.pages[id];
+                    if (page && page.frameRefCount > 0) {
+                        page.frameRefCount--;
+                    }
+                }
+            });
+        }
+    }
+
+    // Record demand priority for the eviction tie-break, then feed the scheduler.
+    for (const item of demand) {
+        const page = runtime.gpu.pages[item.pageId];
+        if (page) {
+            page.priority = item.priority;
+        }
+    }
+    if (demand.length > 0 || runtime.scheduler) {
+        submitMeshLoDDemand(ensureMeshLoDScheduler(runtime), demand, frame);
+    }
+
+    // Trim resident fine pages down to a possibly-lowered effective GPU budget.
+    const policy: MeshLoDEvictionPolicy = {
+        budgetBytes: floorToBlocks(runtime.settings.cacheBudgetBytes),
+        currentFrame: frame,
+        residencyHoldFrames: runtime.settings.residencyHoldFrames,
+    };
+    const evicted: number[] = [];
+    evictMeshLoDToBudget(runtime.gpu.arena, runtime.gpu.pages, runtime.pageRecords, policy, evicted);
+    applyStreamedEvictions(runtime, evicted);
+
+    if (selectionStats) {
+        const d = runtime.diagnostics as MeshLoDMutableDiagnostics;
+        d.frameIndex = frame;
+        d.visibleGroupCount = selectionStats.visibleGroupCount;
+        d.fallbackGroupCount = selectionStats.fallbackGroupCount;
+        d.maximumSelectedErrorPixels = selectionStats.maximumSelectedErrorPixels;
+        d.maximumUnmetErrorPixels = selectionStats.maximumUnmetErrorPixels;
+    } else {
+        (runtime.diagnostics as MeshLoDMutableDiagnostics).frameIndex = frame;
+    }
+    refreshMeshLoDStreamingDiagnostics(runtime);
+}
+
+/** @internal Cancel every outstanding fine-page request and drop the scheduler. Called
+ *  from disposal and device recovery; late completions are already stale by generation. */
+export function _disposeMeshLoDScheduler(runtime: MeshLoDAssetRuntime): void {
+    if (runtime.scheduler) {
+        disposeMeshLoDRequestScheduler(runtime.scheduler);
+        runtime.scheduler = null;
+    }
 }

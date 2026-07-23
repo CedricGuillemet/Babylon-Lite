@@ -16,7 +16,9 @@ import type { Camera } from "../camera/camera.js";
 import { getCameraPosition } from "../camera/camera.js";
 import type { PbrMaterialProps } from "../material/pbr/pbr-material.js";
 import type { MeshLoDAsset, MeshLoDInstance } from "./mesh-lod.js";
-import type { MeshLoDAssetRuntime } from "./mesh-lod-runtime.js";
+import type { MeshLoDAssetRuntime, MeshLoDStreamSelectionStats } from "./mesh-lod-runtime.js";
+import { stepMeshLoDStreaming } from "./mesh-lod-runtime.js";
+import type { MeshLoDPageDemand } from "./mesh-lod-scheduler.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDCamera, MeshLoDSelectionResult } from "./mesh-lod-selection-cpu.js";
 import { selectMeshLoDCpu } from "./mesh-lod-selection-cpu.js";
@@ -246,4 +248,42 @@ export function selectMeshLoDBatch(batch: MeshLoDSceneBatch, context: DrawUpdate
         selections.push({ instance, result });
     }
     return selections;
+}
+
+/** Aggregate one batch's per-instance selection into asset-level fine-page demand and
+ *  drive the asset's streaming step. Unions each instance's desired pages (keeping the
+ *  highest per-page priority), collects the pages every selected cluster references (so
+ *  they hold a frame reference and are never evicted while the built frame is in flight),
+ *  and publishes the visible/fallback/error selection diagnostics. Called once per frame
+ *  by the material renderable after selection, before it writes the draw stream. */
+export function driveMeshLoDStreaming(batch: MeshLoDSceneBatch, selections: readonly MeshLoDInstanceSelection[]): void {
+    const runtime: MeshLoDAssetRuntime = batch.asset._runtime;
+    const priorityByPage = new Map<number, number>();
+    const referenced = new Set<number>();
+    let visibleGroupCount = 0;
+    let fallbackGroupCount = 0;
+    let maximumSelectedErrorPixels = 0;
+    let maximumUnmetErrorPixels = 0;
+    for (const { result } of selections) {
+        for (const page of result.desiredPages) {
+            const existing = priorityByPage.get(page.pageId);
+            if (existing === undefined || page.priority > existing) {
+                priorityByPage.set(page.pageId, page.priority);
+            }
+        }
+        for (const clusterId of result.selectedClusterIds) {
+            referenced.add(runtime.clusters[clusterId]!.pageId);
+        }
+        visibleGroupCount = Math.max(visibleGroupCount, result.visibleGroupCount);
+        fallbackGroupCount = Math.max(fallbackGroupCount, result.fallbackGroupCount);
+        maximumSelectedErrorPixels = Math.max(maximumSelectedErrorPixels, result.maximumSelectedErrorPixels);
+        maximumUnmetErrorPixels = Math.max(maximumUnmetErrorPixels, result.maximumUnmetErrorPixels);
+    }
+    const demand: MeshLoDPageDemand[] = [];
+    for (const [pageId, priority] of priorityByPage) {
+        demand.push({ pageId, priority });
+    }
+    demand.sort((a, b) => (b.priority !== a.priority ? b.priority - a.priority : a.pageId - b.pageId));
+    const stats: MeshLoDStreamSelectionStats = { visibleGroupCount, fallbackGroupCount, maximumSelectedErrorPixels, maximumUnmetErrorPixels };
+    stepMeshLoDStreaming(runtime, demand, [...referenced], stats);
 }

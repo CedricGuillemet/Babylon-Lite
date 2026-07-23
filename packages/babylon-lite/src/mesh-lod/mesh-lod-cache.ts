@@ -260,6 +260,27 @@ export function reserveMeshLoDArenaRun(
     return offset;
 }
 
+/** Evict eligible resident victims (oldest use, then lower priority, then higher id)
+ *  until committed residency fits within `policy.budgetBytes`, or no eligible victim
+ *  remains. Applies a lowered effective `cacheBudgetBytes` deterministically without
+ *  touching pinned, current-frame-referenced, in-flight, or held pages. Every evicted
+ *  id is appended to `evicted` for GPU page-state and diagnostics sync (§11.4). */
+export function evictMeshLoDToBudget(
+    arena: MeshLoDArena,
+    pages: readonly MeshLoDPageRuntime[],
+    records: readonly MeshLoDPageRecord[],
+    policy: MeshLoDEvictionPolicy,
+    evicted: number[]
+): void {
+    while (arenaUsedBytes(arena) > policy.budgetBytes) {
+        const victim = pickVictim(pages, records, policy);
+        if (!victim) {
+            return;
+        }
+        evictMeshLoDPage(arena, victim, evicted);
+    }
+}
+
 // ─── CPU encoded-page cache (architecture §11.5) ─────────────────────
 
 interface CpuCacheEntry {

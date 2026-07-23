@@ -115,11 +115,15 @@ describe("MeshLoD lazy coarse path", () => {
         const asset = await loadMeshLoD(engine, "https://cdn.test/statue.mlod", { request: { fetch: server.fetch }, selectionMode: "cpu" });
 
         const { drawCount } = await renderCoarse(asset, engine);
-        // No holes: coarse geometry rasterizes, one indirect draw, asset never failed.
+        // Phase-6 streaming demands fine pages while rendering; this server makes every
+        // fine page permanently unavailable (500). Each failed fine fetch is page-local:
+        // the coarse geometry still rasterizes as one indirect draw, no fine page ever
+        // becomes resident, and the asset never fails (REQ-SEL-7).
         expect(drawCount).toBe(1);
         expect(asset.diagnostics.renderedTriangleCount).toBeGreaterThan(0);
         expect(asset.state).toBe("ready");
-        expect(server.fineRequests).toBe(0);
+        expect(server.fineRequests).toBeGreaterThan(0);
+        expect(asset.diagnostics.residentPageCount).toBe(asset.metadata.pinnedPageCount);
     });
 
     it("keeps coarse geometry usable across repeated frames without requesting fine pages", async () => {

@@ -12,6 +12,7 @@
 
 import { BU } from "../../engine/gpu-flags.js";
 import type { EngineContext } from "../../engine/engine.js";
+import { retireGpuResources } from "../../engine/gpu-resource-retirement.js";
 import type { SceneContext } from "../../scene/scene-core.js";
 import type { Mat4 } from "../../math/types.js";
 import type { DrawBinding, DrawUpdateContext, Renderable } from "../../render/renderable.js";
@@ -25,7 +26,7 @@ import type { Texture2D } from "../../texture/texture-2d.js";
 import { createSolidTexture2D } from "../../texture/solid-texture.js";
 import type { PbrMaterialProps } from "./pbr-material.js";
 import type { MeshLoDSceneBatch } from "../../mesh-lod/mesh-lod-scene.js";
-import { selectMeshLoDBatch } from "../../mesh-lod/mesh-lod-scene.js";
+import { driveMeshLoDStreaming, selectMeshLoDBatch } from "../../mesh-lod/mesh-lod-scene.js";
 import { createMeshLoDError } from "../../mesh-lod/mesh-lod-errors.js";
 import type { MeshLoDGpuBatchState, MeshLoDGpuFrameParams, MeshLoDGpuInstanceState, MeshLoDUpdateBatch } from "../../mesh-lod/mesh-lod-selection-gpu.js";
 import {
@@ -132,17 +133,21 @@ interface MeshLoDBatchPacket {
     readonly features: MeshLoDShaderFeatures;
     readonly shaderModule: GPUShaderModule;
     readonly bindGroupLayout: GPUBindGroupLayout;
-    readonly bindGroup: GPUBindGroup;
+    /** CPU-path group-1 bind group. Rebuilt make-before-break when the draw-vertex
+     *  buffer grows to hold streamed refinement. */
+    bindGroup: GPUBindGroup;
     readonly pipelines: Map<string, GPURenderPipeline>;
-    readonly drawVertexBuffer: GPUBuffer;
+    /** Draw-vertex stream buffer. Grows (make-before-break) past the coarse bound as
+     *  fine pages stream in and selection refines. */
+    drawVertexBuffer: GPUBuffer;
     readonly instanceBuffer: GPUBuffer;
     readonly indirectBuffer: GPUBuffer;
     readonly materialUbo: GPUBuffer;
     readonly arena: GPUBuffer;
-    readonly drawScratch: Uint32Array;
+    drawScratch: Uint32Array;
     readonly instanceScratch: Float32Array;
     readonly indirectScratch: Uint32Array;
-    readonly maxDrawVertices: number;
+    maxDrawVertices: number;
     readonly maxInstances: number;
     /** Per-instance coarse expanded-vertex bound, for GPU draw-vertex buffer sizing. */
     readonly coarseVertices: number;
@@ -267,12 +272,43 @@ function writeInstanceRecord(out: Float32Array, floatOffset: number, world: Mat4
     out[floatOffset + 27] = 0;
 }
 
+/** Grow the CPU draw-vertex buffer + scratch (make-before-break) so the streamed
+ *  refinement's expanded vertices fit. Rebuilds the group-1 bind group against the new
+ *  buffer and retires the old one after the next submitted frame drains. No-op while the
+ *  selection fits the current capacity (the coarse-only case never grows). */
+function ensureCpuDrawCapacity(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, neededVertices: number): void {
+    if (neededVertices <= packet.maxDrawVertices) {
+        return;
+    }
+    let capacity = packet.maxDrawVertices;
+    while (capacity < neededVertices) {
+        capacity *= 2;
+    }
+    const runtime = batch.asset._runtime;
+    const oldBuffer = packet.drawVertexBuffer;
+    packet.drawVertexBuffer = engine._device.createBuffer({ label: "mesh-lod-draw-vertices", size: capacity * DRAW_VERTEX_STRIDE, usage: BU.STORAGE | BU.COPY_DST });
+    packet.drawScratch = new Uint32Array(capacity * 4);
+    packet.maxDrawVertices = capacity;
+    packet.bindGroup = buildBindGroup(engine, packet.bindGroupLayout, batch.material, packet.drawVertexBuffer, packet.instanceBuffer, runtime.gpu.arena.buffer, packet.materialUbo);
+    retireGpuResources(engine, () => oldBuffer.destroy());
+}
+
 /** Per-frame CPU selection + expansion (reference/diagnostic mode): run the oracle for
  *  each visible instance, write its world/normal matrices, and flatten selected pinned
  *  clusters into the draw-vertex stream, then publish the single indirect vertex count. */
 function updatePacketCpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet: MeshLoDBatchPacket, context: DrawUpdateContext): void {
     const runtime = batch.asset._runtime;
     const selections = selectMeshLoDBatch(batch, context);
+    // Feed this frame's fine-page demand + frame references to the streaming engine.
+    driveMeshLoDStreaming(batch, selections);
+    // Grow the draw-vertex buffer if streamed refinement expands past the coarse bound.
+    let neededVertices = 0;
+    for (let i = 0; i < selections.length && i < packet.maxInstances; i++) {
+        for (const clusterId of selections[i]!.result.selectedClusterIds) {
+            neededVertices += runtime.clusters[clusterId]!.triangleCount * 3;
+        }
+    }
+    ensureCpuDrawCapacity(engine, batch, packet, neededVertices);
     const draw = packet.drawScratch;
     const inst = packet.instanceScratch;
     let vertexCount = 0;
