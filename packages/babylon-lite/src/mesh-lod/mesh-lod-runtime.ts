@@ -23,7 +23,7 @@ import type { MeshLoDArena } from "./mesh-lod-cache.js";
 import { allocateArenaRun, arenaUsedBytes, createMeshLoDArena, floorToBlocks, pinnedAllocationBytes } from "./mesh-lod-cache.js";
 import { decodeMeshLoDPage, getMeshLoDPageDecoder } from "./mesh-lod-page-decoder.js";
 import { addMeshLoDInstanceToScene, removeMeshLoDInstanceFromScene } from "./mesh-lod-scene.js";
-import type { MeshLoDGpuAssetBuffers } from "./mesh-lod-selection-gpu.js";
+import type { MeshLoDGpuAssetBuffers, MeshLoDGpuSelectedPair } from "./mesh-lod-selection-gpu.js";
 /** Effective, fully-resolved runtime settings (defaults applied, values validated). */
 export interface MeshLoDEffectiveSettings {
     screenSpaceError: number;
@@ -418,6 +418,22 @@ export async function _loadMeshLoD(
  *  registry module). */
 export function _addMeshLoDToScene(scene: SceneContext, instance: MeshLoDInstance): void {
     addMeshLoDInstanceToScene(scene, instance);
+}
+
+/** @internal Normalize a raw GPU/model selected `(cluster, instance)` list to
+ *  per-instance ascending unique cluster IDs — the canonical form CPU/GPU equivalence
+ *  fixtures and real-device readbacks compare against the CPU oracle's
+ *  `selectedClusterIds`. A testing-only hook kept off the trimmed public declaration
+ *  surface (never re-exported from `index.ts`). Pass `instanceId` to filter one
+ *  instance out of a multi-instance batch readback. */
+export function _normalizeMeshLoDSelectedClusterIds(pairs: readonly MeshLoDGpuSelectedPair[], instanceId?: number): Uint32Array {
+    const ids = new Set<number>();
+    for (const pair of pairs) {
+        if (instanceId === undefined || pair.instanceId === instanceId) {
+            ids.add(pair.clusterId);
+        }
+    }
+    return Uint32Array.from([...ids].sort((a, b) => a - b));
 }
 
 /** Remove an instance from its scene-owned MeshLoD batch (delegates to the scene
