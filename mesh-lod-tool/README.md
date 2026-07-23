@@ -112,4 +112,19 @@ ctest --test-dir mesh-lod-tool/build --output-on-failure
 
 CTest runs in-process smoke assertions plus end-to-end checks of the built
 executable's `--help`, `--version`, pinned revisions, and unknown-argument
-handling.
+handling. A clean configure/build/CTest is verified at **7/7 passing**
+(`tool_smoke`, `cli_help`, `cli_version`, `cli_version_meshoptimizer_pin`,
+`cli_version_cgltf_pin`, `cli_unknown_arg`, `format_vectors`). `tool_smoke`
+(`tests/tool_tests.cpp`) covers option parsing, deterministic naming, ingestion
+and every rejection fixture, hierarchy build, and end-to-end convert /
+validate-only; `format_vectors` (`tests/format_tests.cpp`) covers the binary
+layout, CRC32C, SHA-256, and source-digest vectors.
+
+## Verification
+
+Full requirement-to-evidence traceability for the offline tool, the `.mlod`
+contract, the engine feature, and the demo lives in
+[`docs/lite/architecture/mesh-lod/validation.md`](../docs/lite/architecture/mesh-lod/validation.md).
+The commands in this README are verified there, including deterministic
+byte-identical statue regeneration (SHA-256 compared against the committed
+`lab/public/mesh-lod/` deliverables) and a passing `--validate-only` run.
