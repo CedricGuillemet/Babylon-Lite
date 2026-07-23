@@ -104,6 +104,10 @@ export interface SceneContext extends RenderingContext {
     _beforeRender: ((deltaMs: number) => void)[];
     /** @internal Deferred builders — registered by loaders/factories, run once at startEngine(). */
     _deferredBuilders: (() => void | Promise<void>)[];
+    /** @internal Optional feature renderables to rebuild after device loss (lazy — created
+     *  only when a recoverable feature such as MeshLoD registers). Rebuilt by the generic
+     *  device-recovery flow with no feature-specific branch. */
+    _deferredGpuRecoverables?: DeferredSceneGpuRecoverable[];
     /** @internal Mesh group registry — maps builder to its mesh list (internal bookkeeping). */
     _groups: Map<MeshGroupBuilder, Mesh[]>;
 
@@ -288,6 +292,24 @@ export function getFrameGraph(scene: SceneContext): FrameGraph {
 export interface DeferredSceneRenderables {
     renderables: readonly Renderable[];
     dispose?: () => void;
+}
+
+/** @internal A scene-hosted feature whose GPU renderables must be rebuilt after device
+ *  loss (e.g. MeshLoD). The generic device-recovery flow calls {@link rebuild} — which
+ *  recreates the feature's GPU resources and returns fresh renderables — after ordinary
+ *  material groups are rebuilt, so the recovery module carries no feature-specific branch. */
+export interface DeferredSceneGpuRecoverable {
+    /** Recreate the feature's GPU resources on the recovered device and return the new
+     *  renderables to append to the scene. */
+    rebuild(engine: EngineContext, scene: SceneContext): Renderable[] | Promise<Renderable[]>;
+    /** Tear down the feature's GPU resources on scene disposal. */
+    dispose(): void;
+}
+
+/** @internal Register a feature that must rebuild its GPU renderables on device recovery.
+ *  The list is created lazily so scenes without such a feature carry no field. */
+export function addDeferredSceneGpuRecoverable(scene: SceneContext, recoverable: DeferredSceneGpuRecoverable): void {
+    (scene._deferredGpuRecoverables ??= []).push(recoverable);
 }
 
 /** @internal Register optional scene-hosted render work without teaching `addToScene` about the feature. */

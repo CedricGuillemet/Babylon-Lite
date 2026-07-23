@@ -254,6 +254,13 @@ async function rebuildSceneGpu(engine: EngineContext, scene: SceneContext): Prom
             scene._uniformUpdaters.push(result.updater);
         }
     }
+    // Rebuild optional feature renderables (e.g. MeshLoD) through the generic recoverable
+    // seam, after ordinary groups. No feature-specific branch lives in this module.
+    if (scene._deferredGpuRecoverables) {
+        for (const recoverable of scene._deferredGpuRecoverables) {
+            scene._renderables.push(...(await recoverable.rebuild(engine, scene)));
+        }
+    }
     scene._renderables.sort((a, b) => a.order - b.order);
     scene._renderableVersion++;
     resetFrameGraphTasks(engine, scene);

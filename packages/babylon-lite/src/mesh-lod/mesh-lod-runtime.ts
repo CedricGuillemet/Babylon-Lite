@@ -240,8 +240,12 @@ export interface MeshLoDAssetRuntime {
     readonly hierarchyNodes: readonly MeshLoDHierarchyNode[];
     readonly pageRecords: readonly MeshLoDPageRecord[];
     readonly groupPageRefs: Uint32Array;
-    /** Immutable geometry arena and per-page residency (pinned coarse pages GPU-resident at resolve). */
-    readonly gpu: MeshLoDGpuState;
+    /** Immutable geometry arena and per-page residency (pinned coarse pages GPU-resident at resolve).
+     *  Replaced wholesale on device recovery (a fresh arena on the recovered device). */
+    gpu: MeshLoDGpuState;
+    /** The device the current {@link gpu} buffers belong to; used to make device recovery
+     *  idempotent across a shared asset's scenes. */
+    gpuDevice: GPUDevice;
     /** Shared per-asset GPU selection buffers (immutable hierarchy + mutable page state).
      *  Built lazily on the first GPU selection; `null` until then and after device change. */
     gpuSelection: MeshLoDGpuAssetBuffers | null;
@@ -457,6 +461,7 @@ export async function _loadMeshLoD(
         pageRecords: parsed.pageRecords,
         groupPageRefs: parsed.groupPageRefs,
         gpu,
+        gpuDevice: engine._device,
         gpuSelection: null,
         scheduler: null,
         _schedulerTimers: null,
@@ -787,4 +792,72 @@ export function _disposeMeshLoDResources(runtime: MeshLoDAssetRuntime): void {
         runtime.gpu.residentPageCount = 0;
     }
     clearMeshLoDCpuPageCache(runtime.cpuPageCache);
+}
+
+/** @internal Rebuild an asset's GPU residency on the recovered device (architecture §14.3).
+ *  Recreates the geometry arena, re-decodes and re-uploads the retained pinned coarse pages,
+ *  resets fine pages to `unrequested` (restored opportunistically by streaming), and drops
+ *  the shared selection buffers so they rebuild against the new device. Idempotent per
+ *  device (a shared asset recovers once). A pinned re-decode/upload failure is terminal —
+ *  it throws `MLOD_DEVICE_RECOVERY` and leaves no partial coarse residency, so recovery
+ *  cannot claim success. Old resources on a truly lost device need no queue retirement. */
+export function _recoverMeshLoDAsset(engine: EngineContext, runtime: MeshLoDAssetRuntime): void {
+    if (runtime.disposed || runtime.gpuDevice === engine._device) {
+        return;
+    }
+    // Invalidate any in-flight completion from the lost device, then drop the stale scheduler.
+    runtime.generation += 1;
+    _disposeMeshLoDScheduler(runtime);
+
+    const pinnedBytes = pinnedAllocationBytes(runtime.pageRecords);
+    const arena = createMeshLoDArena(engine, runtime.settings.cacheCapacityBytes, pinnedBytes);
+    const pages: MeshLoDPageRuntime[] = runtime.pageRecords.map((record, id) => ({
+        id,
+        state: "unrequested" as MeshLoDPageState,
+        arenaOffset: -1,
+        arenaBytes: 0,
+        vertexByteOffset: record.vertexByteOffset,
+        indices: null,
+        lastUsedFrame: 0,
+        priority: 0,
+        frameRefCount: 0,
+    }));
+
+    let residentPageCount = 0;
+    for (let id = 0; id < runtime.pageRecords.length; id++) {
+        const record = runtime.pageRecords[id]!;
+        if (!record.pinned) {
+            continue; // Fine pages restore opportunistically through streaming.
+        }
+        const encoded = getMeshLoDCpuPage(runtime.cpuPageCache, id, runtime.frameIndex);
+        if (!encoded) {
+            throw createMeshLoDError("MLOD_DEVICE_RECOVERY", "retained pinned coarse bytes are unavailable for device recovery", { pageId: id });
+        }
+        let decoded: DecodedMeshLoDPage;
+        try {
+            decoded = decodeMeshLoDPage(encoded, record, runtime.decoderModule);
+        } catch (cause) {
+            throw createMeshLoDError("MLOD_DEVICE_RECOVERY", "failed to re-decode a pinned coarse page during device recovery", {
+                pageId: id,
+                actual: (cause as MeshLoDError)?.message,
+            });
+        }
+        const offset = allocateArenaRun(arena, record.decodedBytes, true);
+        if (offset === null) {
+            throw createMeshLoDError("MLOD_DEVICE_RECOVERY", "recovered geometry arena cannot hold the pinned coarse pages", { pageId: id });
+        }
+        engine._device.queue.writeBuffer(arena.buffer, offset, decoded.decoded.buffer as ArrayBuffer, decoded.decoded.byteOffset, decoded.decoded.byteLength);
+        pages[id]!.arenaOffset = offset;
+        pages[id]!.arenaBytes = record.decodedBytes;
+        pages[id]!.indices = new Uint16Array(decoded.decoded.buffer, decoded.decoded.byteOffset + record.indexByteOffset, record.localIndexCount).slice();
+        pages[id]!.state = "gpu-resident";
+        residentPageCount++;
+    }
+
+    runtime.gpu = { arena, pages, residentPageCount };
+    runtime.gpuSelection = null; // rebuilt against the new device on the next selection
+    runtime.gpuDevice = engine._device;
+    const d = runtime.diagnostics as MeshLoDMutableDiagnostics;
+    d.gpuCacheCapacityBytes = arena.capacityBytes;
+    refreshMeshLoDStreamingDiagnostics(runtime);
 }

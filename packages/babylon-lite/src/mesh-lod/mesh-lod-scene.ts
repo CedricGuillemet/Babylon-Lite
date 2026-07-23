@@ -9,17 +9,19 @@
  *  WGSL, pipelines, or bind groups. Add/remove are idempotent and take effect
  *  before the next selection. */
 
-import type { SceneContext } from "../scene/scene-core.js";
-import { addDeferredSceneRenderables } from "../scene/scene-core.js";
+import type { SceneContext, DeferredSceneGpuRecoverable } from "../scene/scene-core.js";
+import { addDeferredSceneRenderables, addDeferredSceneGpuRecoverable } from "../scene/scene-core.js";
+import type { EngineContext } from "../engine/engine.js";
 import type { Renderable, DrawUpdateContext } from "../render/renderable.js";
 import type { Camera } from "../camera/camera.js";
 import { getCameraPosition } from "../camera/camera.js";
 import type { PbrMaterialProps } from "../material/pbr/pbr-material.js";
 import type { MeshLoDAsset, MeshLoDInstance } from "./mesh-lod.js";
 import type { MeshLoDAssetRuntime, MeshLoDStreamSelectionStats } from "./mesh-lod-runtime.js";
-import { stepMeshLoDStreaming } from "./mesh-lod-runtime.js";
+import { stepMeshLoDStreaming, _recoverMeshLoDAsset } from "./mesh-lod-runtime.js";
 import type { MeshLoDPageDemand } from "./mesh-lod-scheduler.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
+import type { MeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDCamera, MeshLoDSelectionResult } from "./mesh-lod-selection-cpu.js";
 import { selectMeshLoDCpu } from "./mesh-lod-selection-cpu.js";
 
@@ -130,32 +132,83 @@ async function getPbrMeshLoDModule(): Promise<typeof import("../material/pbr/pbr
     return _pbrMeshLoDModule;
 }
 
+/** Build the material-owned indirect renderable for every batch in the scene, skipping an
+ *  asset that failed device recovery (its GPU arena is gone) or was disposed. Shared by the
+ *  initial deferred build and the device-recovery rebuild. */
+async function buildMeshLoDBatchRenderables(engine: EngineContext, scene: SceneContext): Promise<Renderable[]> {
+    const registry = scene._meshLoDRegistry;
+    const renderables: Renderable[] = [];
+    if (!registry) {
+        return renderables;
+    }
+    const pbr = await getPbrMeshLoDModule();
+    for (const batch of registry.batches) {
+        if (batch.asset.state === "failed" || batch.asset._runtime.disposed) {
+            continue;
+        }
+        const renderable = pbr.buildMeshLoDBatchRenderable(engine, scene, batch);
+        if (renderable) {
+            batch.renderable = renderable;
+            renderables.push(renderable);
+        }
+    }
+    return renderables;
+}
+
+/** Dispose every batch's material-owned GPU packet (scene teardown). Idempotent. */
+function disposeMeshLoDBatchPackets(scene: SceneContext): void {
+    const registry = scene._meshLoDRegistry;
+    if (!registry) {
+        return;
+    }
+    for (const batch of registry.batches) {
+        (batch as { _packet?: { dispose?: () => void } })._packet?.dispose?.();
+        batch._packet = undefined;
+        batch.renderable = undefined;
+    }
+}
+
+/** Recover every asset registered in the scene onto the current device (idempotent per
+ *  device, so a shared asset recovers once). A pinned-coarse recovery failure marks that
+ *  asset failed with `MLOD_DEVICE_RECOVERY`; its batches are then skipped when renderables
+ *  are rebuilt, so recovery cannot claim success for it. */
+function recoverMeshLoDAssets(engine: EngineContext, scene: SceneContext): void {
+    const registry = scene._meshLoDRegistry;
+    if (!registry) {
+        return;
+    }
+    for (const asset of registry.byAsset.keys()) {
+        if (asset._runtime.disposed || asset._runtime.gpuDevice === engine._device) {
+            continue;
+        }
+        asset.state = "recovering";
+        try {
+            _recoverMeshLoDAsset(engine, asset._runtime);
+            asset.state = "ready";
+        } catch (error) {
+            asset.state = "failed";
+            asset.error = error as MeshLoDError;
+        }
+    }
+}
+
 function registerDeferredBuilder(scene: SceneContext): void {
-    addDeferredSceneRenderables(scene, async (engine, sc) => {
-        const registry = sc._meshLoDRegistry;
-        const renderables: Renderable[] = [];
-        if (!registry) {
-            return { renderables };
-        }
-        const pbr = await getPbrMeshLoDModule();
-        for (const batch of registry.batches) {
-            const renderable = pbr.buildMeshLoDBatchRenderable(engine, sc, batch);
-            if (renderable) {
-                batch.renderable = renderable;
-                renderables.push(renderable);
-            }
-        }
-        return {
-            renderables,
-            dispose: () => {
-                for (const batch of registry.batches) {
-                    (batch as { _packet?: { dispose?: () => void } })._packet?.dispose?.();
-                    batch._packet = undefined;
-                    batch.renderable = undefined;
-                }
-            },
-        };
-    });
+    // One recoverable owns rebuild + dispose; the initial deferred build reuses the same
+    // rebuild path (device recovery just re-runs it against the recovered device).
+    const recoverable: DeferredSceneGpuRecoverable = {
+        async rebuild(engine, sc) {
+            recoverMeshLoDAssets(engine, sc);
+            return buildMeshLoDBatchRenderables(engine, sc);
+        },
+        dispose() {
+            disposeMeshLoDBatchPackets(scene);
+        },
+    };
+    addDeferredSceneGpuRecoverable(scene, recoverable);
+    addDeferredSceneRenderables(scene, async (engine, sc) => ({
+        renderables: await buildMeshLoDBatchRenderables(engine, sc),
+        dispose: () => recoverable.dispose(),
+    }));
 }
 
 /** @internal Register an instance into its scene-owned batch. Idempotent for the
