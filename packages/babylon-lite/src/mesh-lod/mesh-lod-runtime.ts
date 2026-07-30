@@ -144,6 +144,9 @@ export interface MeshLoDCluster {
     readonly vertexCount: number;
     readonly triangleCount: number;
     readonly sourceTriangleCount: number;
+    /** Local-space normal-cone axis xyz and conservative cutoff, or null when
+     *  the meshlet cone spans too much of the sphere to cull safely. */
+    readonly normalCone?: readonly [number, number, number, number] | null;
 }
 
 /** Parsed 8-wide hierarchy node (32-byte record). */

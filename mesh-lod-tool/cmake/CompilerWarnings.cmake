@@ -14,3 +14,14 @@ function(mlod_set_project_warnings target)
             -Wsign-conversion)
     endif()
 endfunction()
+
+# Deterministic floating-point settings keep output stable across native
+# compiler targets. MSVC uses strict IEEE behavior; Clang/GCC disable
+# contraction so FMA availability cannot silently change rounding.
+function(mlod_set_deterministic_floating_point target)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /fp:strict)
+    else()
+        target_compile_options(${target} PRIVATE -ffp-contract=off)
+    endif()
+endfunction()

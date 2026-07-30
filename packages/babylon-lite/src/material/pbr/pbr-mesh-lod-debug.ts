@@ -10,6 +10,9 @@
 import type { MeshLoDDebugView } from "../../mesh-lod/mesh-lod.js";
 import type { MeshLoDPageState } from "../../mesh-lod/mesh-lod-runtime.js";
 
+const CONE_F32 = new Float32Array(1);
+const CONE_U32 = new Uint32Array(CONE_F32.buffer);
+
 /** Shader `debugMode` code (0 = off). Mirrored by the WGSL fragment branch. */
 export function meshLoDDebugModeCode(view: MeshLoDDebugView): number {
     switch (view) {
@@ -23,6 +26,8 @@ export function meshLoDDebugModeCode(view: MeshLoDDebugView): number {
             return 4;
         case "requested-pages":
             return 5;
+        case "meshlet-cone":
+            return 6;
         default:
             return 0;
     }
@@ -61,6 +66,12 @@ export function meshLoDPageRequestCode(pinned: boolean, state: MeshLoDPageState)
         default:
             return 0;
     }
+}
+
+/** Bitcast a cone-culling margin into the draw vertex's reserved u32 word. */
+export function meshLoDConeDebugAttr(margin: number): number {
+    CONE_F32[0] = margin;
+    return CONE_U32[0]!;
 }
 
 /** Per-cluster attribute stored in the reserved draw-vertex word for the active

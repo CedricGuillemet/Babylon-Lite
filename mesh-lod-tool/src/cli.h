@@ -1,6 +1,8 @@
 #ifndef MLOD_CLI_H
 #define MLOD_CLI_H
 
+#include "exit_code.h"
+
 #include <cstdint>
 #include <ostream>
 #include <string>
@@ -8,20 +10,16 @@
 
 namespace mlod {
 
-// Process exit codes shared by the CLI and later conversion stages
-// (architecture section 7.7). Keep this the single definition so diagnostics
-// map failure classes to stable codes.
-enum ExitCode : int {
-    kExitSuccess = 0,
-    kExitCli = 2,         // CLI argument error
-    kExitIo = 3,          // input/output I/O error
-    kExitMalformed = 4,   // malformed glTF/GLB/accessor
-    kExitUnsupported = 5, // unsupported source feature/layout/material
-    kExitHierarchy = 6,   // hierarchy generation failure
-    kExitValidation = 7,  // output validation/integrity failure
-    kExitWrite = 8,       // final write/rename failure
-};
-
+// NATIVE-ADAPTER STATE (architecture section 7.9 / 7.8 "mesh-lod-native-adapter").
+// ConversionOptions is CLI-shaped host state: it combines the host-independent
+// canonical settings (see ConversionSettings in conversion_types.h) with
+// filesystem-only concerns -- input/output paths, a stats-JSON path, and
+// validate-only -- that exist only because the native adapter talks to a
+// filesystem. It is not the canonical schema: `toConversionSettings` below
+// maps the output-affecting subset into the portable contract. New
+// output-affecting knobs are added to ConversionSettings first and mapped
+// here, never defined only on this native-only struct.
+//
 // Fully resolved conversion request. All conversion-affecting knobs carry their
 // architecture-defined defaults; file paths are stored exactly as supplied and
 // are never absolutized or otherwise rewritten.
@@ -71,6 +69,47 @@ int runConversion(const ConversionOptions& options, std::ostream& out, std::ostr
 // Full command-line entry: resolves --help/--version, parses and validates
 // convert-mode options, and dispatches conversion. Returns an ExitCode.
 int runCli(const std::vector<std::string>& args, std::ostream& out, std::ostream& err);
+
+} // namespace mlod
+
+// Included after ConversionOptions is fully defined above: conversion_types.h
+// only depends on exit_code.h (via diagnostics.h) and never back on cli.h, so
+// this stays a one-directional native-adapter -> core-contracts include.
+#include "conversion_types.h"
+
+namespace mlod {
+
+// Maps native selection flags (--mesh/--primitive) into the host-independent
+// PrimitiveSelection contract (conversion_types.h).
+inline PrimitiveSelection toPrimitiveSelection(const ConversionOptions& options) {
+    if (options.hasPrimitive) {
+        return PrimitiveSelection::singlePrimitive(options.meshIndex, options.primitiveIndex);
+    }
+    if (options.hasMesh) {
+        return PrimitiveSelection::wholeMesh(options.meshIndex);
+    }
+    return PrimitiveSelection::allPrimitives();
+}
+
+// Maps native ConversionOptions into the host-independent, output-affecting
+// ConversionSettings contract (conversion_types.h). Native-only fields --
+// input/output/stats paths and validateOnly -- have no counterpart in
+// ConversionSettings and are dropped by this mapping; they never affect
+// canonicalConversionSettings/canonicalConversionOptions.
+inline ConversionSettings toConversionSettings(const ConversionOptions& options) {
+    ConversionSettings settings;
+    settings.selection = toPrimitiveSelection(options);
+    settings.meshletMaxVertices = options.meshletMaxVertices;
+    settings.meshletMinTriangles = options.meshletMinTriangles;
+    settings.meshletMaxTriangles = options.meshletMaxTriangles;
+    settings.partitionSize = options.partitionSize;
+    settings.simplifyRatio = options.simplifyRatio;
+    settings.simplifyThreshold = options.simplifyThreshold;
+    settings.pageMinKiB = options.pageMinKiB;
+    settings.pageTargetKiB = options.pageTargetKiB;
+    settings.pageMaxKiB = options.pageMaxKiB;
+    return settings;
+}
 
 } // namespace mlod
 

@@ -73,6 +73,10 @@ enum GroupFlag : std::uint16_t {
     kGroupFlagPinnedCoarse = 1u << 1,
 };
 
+enum ClusterFlag : std::uint32_t {
+    kClusterFlagNormalCone = 1u << 0,
+};
+
 // Page-table / stored-page flag bits.
 enum PageFlag : std::uint32_t {
     kPageFlagPinned = 1u << 0,

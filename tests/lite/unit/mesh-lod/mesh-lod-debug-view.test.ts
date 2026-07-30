@@ -15,6 +15,7 @@ describe("meshLoDDebugModeCode", () => {
         expect(meshLoDDebugModeCode("selected-group")).toBe(3);
         expect(meshLoDDebugModeCode("page-residency")).toBe(4);
         expect(meshLoDDebugModeCode("requested-pages")).toBe(5);
+        expect(meshLoDDebugModeCode("meshlet-cone")).toBe(6);
     });
 });
 

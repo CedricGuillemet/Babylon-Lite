@@ -21,6 +21,9 @@ struct HierarchyCluster {
     std::uint16_t vertexCount = 0;
     std::uint16_t triangleCount = 0;
     std::uint32_t sourceTriangles = 0; // original triangles this cluster represents
+    bool normalConeValid = false;
+    float normalConeAxis[3] = {0.0f, 0.0f, 0.0f};
+    float normalConeCutoff = 1.0f;
     std::uint32_t pageId = 0;              // assigned by page packing
     std::uint32_t firstVertexInPage = 0;   // vertex base within the decoded page
     std::uint32_t firstLocalIndexInPage = 0; // index base (u16 elements) within the page
@@ -73,10 +76,15 @@ struct PrimitiveHierarchy {
 };
 
 // Builds the clustered group-DAG and eight-wide hierarchy forest from normalized
-// geometry using meshoptimizer's clusterlod facilities with the CLI-configured
+// geometry using meshoptimizer's clusterlod facilities with the given
 // meshlet/partition/simplification settings and mandatory boundary protection.
 // Validates the result before returning. Returns kExitSuccess or kExitHierarchy
 // with a contextual diagnostic on err.
+int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionSettings& settings,
+                   PrimitiveHierarchy& out, std::ostream& err);
+
+// Native-adapter overload: maps `options` to ConversionSettings and delegates.
+// Kept for native CLI/test source compatibility (architecture section 7.9).
 int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions& options,
                    PrimitiveHierarchy& out, std::ostream& err);
 
@@ -84,6 +92,10 @@ int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions
 // finite bounds/errors, local-index consistency, node structure, and exact
 // terminal-group coverage of the source surface. Returns kExitSuccess or
 // kExitHierarchy.
+int validateHierarchy(const PrimitiveHierarchy& hierarchy, const ConversionSettings& settings,
+                      std::ostream& err);
+
+// Native-adapter overload: maps `options` to ConversionSettings and delegates.
 int validateHierarchy(const PrimitiveHierarchy& hierarchy, const ConversionOptions& options,
                       std::ostream& err);
 

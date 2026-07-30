@@ -968,7 +968,7 @@ groupResident(G) = every page in G.pageRefs is GPU-resident
 fineRequired(G)  = hysteretic screen-space decision
 ```
 
-Cluster `C`, owned by group `G`, is selected before cluster-level frustum culling iff:
+Cluster `C`, owned by group `G`, is selected iff:
 
 ```text
 groupResident(G)
@@ -993,9 +993,9 @@ The 8-wide hierarchy forest is traversed separately for each DAG level and insta
 3. reject only if the sphere is strictly outside any normalized frustum plane;
 4. enqueue 1–8 children for internal nodes;
 5. mark the leaf group visible;
-6. after cut selection, test each selected cluster sphere once more before draw expansion.
+6. expand every selected cluster in a visible group without a second cluster-sphere test.
 
-The conservative group/node bounds prevent a visible cluster from being removed by a parent test. Boundary intersection is visible.
+The conservative group/node bounds are the single visibility authority. Keeping each selected group atomic avoids view-dependent holes when tighter cluster bounds disagree with the conservative group coverage. Boundary intersection is visible.
 
 ### 10.5 CPU oracle
 
@@ -1161,7 +1161,7 @@ The `MeshLoDUpdateBatch` submits one compute pass containing ordered dispatches:
 2. **Instance upload:** CPU writes changed world/normal matrices and instance flags, version-gated.
 3. **Hierarchy traversal:** persistent work queue traverses the 8-wide per-level forest and marks visible groups.
 4. **Group evaluation:** one invocation per group/instance computes screen error, applies prior-state hysteresis, checks all group pages, and updates the prior-state bit. Only hierarchy-visible groups atomically accumulate missing-page priorities and visible diagnostics.
-5. **Cluster selection:** one invocation per cluster/instance evaluates the exact group-DAG/residency expression, then cluster-frustum culls. Selected pairs append to `selected cluster list`; triangle and error diagnostics accumulate.
+5. **Cluster selection:** one invocation per cluster/instance evaluates the exact group-DAG/residency expression for hierarchy-visible groups. Selected pairs append to `selected cluster list`; triangle and error diagnostics accumulate.
 6. **Prepare expansion dispatch:** selected count becomes `dispatchWorkgroupsIndirect` X count.
 7. **Expand selected clusters:** one workgroup per selected cluster. Lane zero atomically reserves `triangleCount * 3` draw vertices; all lanes decode packed `u16` local indices, convert them to absolute geometry-arena word offsets, and write 16-byte draw-vertex records.
 8. **Finalize:** publish `drawIndirect.vertexCount`, page-demand readback copy, selected-ID readback when testing/debugging, and diagnostics readback.

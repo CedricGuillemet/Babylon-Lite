@@ -1,5 +1,5 @@
 add_executable(mesh-lod-tool-tests tool_tests.cpp)
-target_link_libraries(mesh-lod-tool-tests PRIVATE mesh-lod-tool-core)
+target_link_libraries(mesh-lod-tool-tests PRIVATE mesh-lod-native-adapter)
 # White-box access to internal converter headers (cli.h and friends).
 target_include_directories(mesh-lod-tool-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 # Checked-in ingestion fixtures resolved by absolute path at test time.
@@ -33,9 +33,22 @@ set_tests_properties(cli_unknown_arg PROPERTIES WILL_FAIL TRUE)
 
 # Binary-format layout and integrity (CRC32C / SHA-256 / fingerprint) vectors.
 add_executable(mesh-lod-format-tests format_tests.cpp)
-target_link_libraries(mesh-lod-format-tests PRIVATE mesh-lod-tool-core)
+target_link_libraries(mesh-lod-format-tests PRIVATE mesh-lod-native-adapter)
 target_include_directories(mesh-lod-format-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_definitions(mesh-lod-format-tests PRIVATE
     MLOD_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
 mlod_set_project_warnings(mesh-lod-format-tests)
 add_test(NAME format_vectors COMMAND mesh-lod-format-tests)
+
+# Converter-core contracts, input/resource resolution, inspection/preflight,
+# and in-memory conversion. The fixtures use the native filesystem adapter, so
+# this executable links the same native stack as the CLI.
+add_executable(mesh-lod-converter-core-tests converter_core_tests.cpp)
+target_link_libraries(mesh-lod-converter-core-tests PRIVATE mesh-lod-native-adapter)
+target_include_directories(mesh-lod-converter-core-tests PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_definitions(mesh-lod-converter-core-tests PRIVATE
+    MLOD_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+mlod_set_project_warnings(mesh-lod-converter-core-tests)
+add_test(NAME converter_core_contracts COMMAND mesh-lod-converter-core-tests)
+add_test(NAME converter_core_inspection COMMAND mesh-lod-converter-core-tests)
+add_test(NAME converter_core_conversion COMMAND mesh-lod-converter-core-tests)

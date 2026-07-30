@@ -124,7 +124,7 @@ void octDecodeNormal(std::int16_t e0, std::int16_t e1, float& x, float& y, float
 }
 
 int packPages(PrimitiveHierarchy& hierarchy, const NormalizedPrimitive& primitive,
-              const ConversionOptions& options, PackedGeometry& out, std::ostream& err) {
+              const ConversionSettings& options, PackedGeometry& out, std::ostream& err) {
     const auto fail = [&](const std::string& message) {
         err << "error: mesh " << hierarchy.meshIndex << " primitive " << hierarchy.primitiveIndex
             << ": page packing " << message << "\n";
@@ -378,6 +378,11 @@ int packPages(PrimitiveHierarchy& hierarchy, const NormalizedPrimitive& primitiv
     }
 
     return kExitSuccess;
+}
+
+int packPages(PrimitiveHierarchy& hierarchy, const NormalizedPrimitive& primitive, const ConversionOptions& options,
+              PackedGeometry& out, std::ostream& err) {
+    return packPages(hierarchy, primitive, toConversionSettings(options), out, err);
 }
 
 int decodeStoredPage(const unsigned char* stored, std::size_t storedSize,

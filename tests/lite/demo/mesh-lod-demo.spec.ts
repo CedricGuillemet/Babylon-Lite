@@ -50,6 +50,10 @@ test.describe("MeshLoD demo workflow", () => {
     test("REQ-DEMO-1/2: ready state, three instances, streamed .mlod", async () => {
         expect(await page.evaluate(() => document.getElementById("renderCanvas")?.dataset.ready)).toBe("true");
         expect(await page.evaluate(() => document.getElementById("renderCanvas")?.dataset.instanceCount)).toBe("3");
+        expect(
+            await page.evaluate(() => document.getElementById("renderCanvas")?.dataset.instanceHandedness),
+            "MeshLoD instances must inherit the glTF importer's RH-to-LH root transform so winding and orientation match the source meshes"
+        ).toBe("negative,negative,negative");
         expect(await metricNumber(page, "src")).toBeGreaterThan(300_000);
         // Loading overlay hidden once ready.
         await expect(page.locator("#loadingOverlay")).toHaveCount(0, { timeout: 5_000 });
@@ -104,7 +108,7 @@ test.describe("MeshLoD demo workflow", () => {
 
     test("REQ-DEMO-6: every debug view recolors with a legend and keeps the statue complete", async () => {
         const none = await canvasShot(page);
-        for (const view of ["meshlet-id", "lod-depth", "selected-group", "page-residency", "requested-pages"]) {
+        for (const view of ["meshlet-id", "lod-depth", "selected-group", "page-residency", "requested-pages", "meshlet-cone"]) {
             await page.selectOption("#mlod-debug", view);
             await page.waitForTimeout(700);
             expect((await page.textContent("#meshLodLegend"))?.toLowerCase()).toContain("legend");
@@ -169,6 +173,16 @@ test.describe("MeshLoD demo workflow", () => {
         await page.waitForTimeout(900);
         const b2 = await camAlpha();
         expect(b2).toBe(b1); // paused → path no longer drives the camera
+    });
+
+    test("model selector loads another converted glTF", async () => {
+        await expect(page.locator("#meshLodModel option")).toHaveCount(7);
+        await Promise.all([page.waitForNavigation(), page.selectOption("#meshLodModel", "detailedsphere")]);
+        await waitReady(page);
+        expect(await page.evaluate(() => document.getElementById("renderCanvas")?.dataset.model)).toBe("detailedsphere");
+        expect(await page.evaluate(() => document.getElementById("renderCanvas")?.dataset.sourceGlb)).toBe("detailedsphere.glb");
+        expect(await page.evaluate(() => document.getElementById("renderCanvas")?.dataset.instanceCount)).toBe("1");
+        await expect(page.locator(".credit")).toBeHidden();
     });
 });
 

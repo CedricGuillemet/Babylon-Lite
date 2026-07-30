@@ -62,6 +62,7 @@ const ATTR_NORMAL = 1 << 1;
 
 const GROUP_FLAG_TERMINAL = 1 << 0;
 const GROUP_FLAG_PINNED_COARSE = 1 << 1;
+const CLUSTER_FLAG_NORMAL_CONE = 1 << 0;
 
 const PAGE_FLAG_PINNED = 1 << 0;
 const PAGE_FLAG_COARSE = 1 << 1;
@@ -483,6 +484,9 @@ const CR = {
     vertexCount: 40,
     triangleCount: 42,
     sourceTriangles: 44,
+    flags: 48,
+    normalCone: 52,
+    coneCutoff: 56,
 } as const;
 const NR = { sphere: 0, error: 16, group: 20, firstChild: 24, childCount: 28 } as const;
 const PT = {
@@ -555,6 +559,20 @@ function parseClusters(reader: Reader, entry: MeshLoDSectionEntry, header: MeshL
         if (pageId >= header.pageCount) {
             throw fail("MLOD_INVALID_HIERARCHY", "cluster page id is out of range", { byteOffset: base });
         }
+        const flags = reader.u32(base + CR.flags);
+        let normalCone: readonly [number, number, number, number] | null = null;
+        if ((flags & CLUSTER_FLAG_NORMAL_CONE) !== 0) {
+            const packed = reader.u32(base + CR.normalCone);
+            const snorm8 = (shift: number): number => {
+                const byte = (packed >>> shift) & 0xff;
+                return (byte >= 0x80 ? byte - 0x100 : byte) / 127;
+            };
+            const cutoff = reader.f32(base + CR.coneCutoff);
+            if (!Number.isFinite(cutoff) || cutoff < 0 || cutoff >= 1) {
+                throw fail("MLOD_INVALID_HIERARCHY", "cluster normal cone cutoff is invalid", { byteOffset: base + CR.coneCutoff });
+            }
+            normalCone = [snorm8(0), snorm8(8), snorm8(16), cutoff];
+        }
         clusters.push({
             center: [reader.f32(base + CR.sphere), reader.f32(base + CR.sphere + 4), reader.f32(base + CR.sphere + 8)],
             radius: reader.f32(base + CR.sphere + 12),
@@ -567,6 +585,7 @@ function parseClusters(reader: Reader, entry: MeshLoDSectionEntry, header: MeshL
             vertexCount: reader.u16(base + CR.vertexCount),
             triangleCount: reader.u16(base + CR.triangleCount),
             sourceTriangleCount: reader.u32(base + CR.sourceTriangles),
+            normalCone,
         });
     }
     return clusters;

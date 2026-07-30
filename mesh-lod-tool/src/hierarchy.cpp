@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdint>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -79,7 +80,7 @@ void computeSourceTriangles(PrimitiveHierarchy& h) {
 
 } // namespace
 
-int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions& options,
+int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionSettings& options,
                    PrimitiveHierarchy& out, std::ostream& err) {
     const auto fail = [&](const std::string& message) {
         err << "error: mesh " << primitive.meshIndex << " primitive " << primitive.primitiveIndex
@@ -173,6 +174,22 @@ int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions
                       hc.vertexCount = static_cast<std::uint16_t>(c.vertex_count);
                       hc.globalIndices.assign(c.indices, c.indices + c.index_count);
 
+                      const meshopt_Bounds coneBounds =
+                          meshopt_computeClusterBounds(c.indices, c.index_count,
+                                                       primitive.positions.data(), vertexCount,
+                                                       sizeof(float) * 3);
+                      copyVec3(hc.center, coneBounds.center);
+                      hc.radius = coneBounds.radius;
+                      hc.normalConeValid = coneBounds.cone_cutoff_s8 < 127;
+                      if (hc.normalConeValid) {
+                          for (std::size_t axis = 0; axis < 3; ++axis) {
+                              hc.normalConeAxis[axis] =
+                                  static_cast<float>(coneBounds.cone_axis_s8[axis]) / 127.0f;
+                          }
+                          hc.normalConeCutoff =
+                              static_cast<float>(coneBounds.cone_cutoff_s8) / 127.0f;
+                      }
+
                       std::vector<unsigned int> localVertices(c.index_count);
                       std::vector<unsigned char> localTriangles(c.index_count);
                       const size_t unique = clodLocalIndices(localVertices.data(),
@@ -197,6 +214,23 @@ int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions
     }
     if (groups.empty() || clusters.empty()) {
         return fail("produced no groups or clusters");
+    }
+
+    // A simplification can legally produce no replacement clusters. Preserve
+    // that region by treating its finest available group as terminal.
+    std::vector<bool> replaced(groups.size(), false);
+    for (const HierarchyCluster& cluster : clusters) {
+        if (cluster.refinedGroupId >= 0) {
+            replaced[static_cast<std::size_t>(cluster.refinedGroupId)] = true;
+        }
+    }
+    for (std::size_t groupId = 0; groupId < groups.size(); ++groupId) {
+        HierarchyGroup& group = groups[groupId];
+        if (!group.terminal && !replaced[groupId]) {
+            group.terminal = true;
+            group.pinned = true;
+            group.simplifiedError = FLT_MAX;
+        }
     }
 
     int maxDepth = 0;
@@ -236,7 +270,12 @@ int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions
     return validateHierarchy(out, options, err);
 }
 
-int validateHierarchy(const PrimitiveHierarchy& h, const ConversionOptions& options,
+int buildHierarchy(const NormalizedPrimitive& primitive, const ConversionOptions& options,
+                   PrimitiveHierarchy& out, std::ostream& err) {
+    return buildHierarchy(primitive, toConversionSettings(options), out, err);
+}
+
+int validateHierarchy(const PrimitiveHierarchy& h, const ConversionSettings& options,
                       std::ostream& err) {
     const auto fail = [&](const std::string& message) {
         err << "error: mesh " << h.meshIndex << " primitive " << h.primitiveIndex << ": hierarchy "
@@ -341,6 +380,11 @@ int validateHierarchy(const PrimitiveHierarchy& h, const ConversionOptions& opti
         if (!finite3(c.center) || !std::isfinite(c.radius) || c.radius < 0.0f) {
             return fail("cluster bounds are not finite");
         }
+        if (c.normalConeValid &&
+            (!finite3(c.normalConeAxis) || !std::isfinite(c.normalConeCutoff) ||
+             c.normalConeCutoff < 0.0f || c.normalConeCutoff >= 1.0f)) {
+            return fail("cluster normal cone is invalid");
+        }
         if (!std::isfinite(c.error)) {
             return fail("cluster error is not finite");
         }
@@ -373,7 +417,10 @@ int validateHierarchy(const PrimitiveHierarchy& h, const ConversionOptions& opti
     // Exact coarse coverage: terminal groups together represent every source
     // triangle exactly once.
     if (terminalSource != h.sourceTriangleCount) {
-        return fail("terminal groups do not cover the exact source surface");
+        std::ostringstream message;
+        message << "terminal groups cover " << terminalSource << " source triangles, expected "
+                << h.sourceTriangleCount;
+        return fail(message.str());
     }
 
     // Completeness: every group is reachable by refining downward from the
@@ -409,6 +456,10 @@ int validateHierarchy(const PrimitiveHierarchy& h, const ConversionOptions& opti
     }
 
     return kExitSuccess;
+}
+
+int validateHierarchy(const PrimitiveHierarchy& h, const ConversionOptions& options, std::ostream& err) {
+    return validateHierarchy(h, toConversionSettings(options), err);
 }
 
 } // namespace mlod

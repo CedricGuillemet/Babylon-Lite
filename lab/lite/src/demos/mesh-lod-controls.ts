@@ -18,6 +18,7 @@ const DEBUG_VIEWS: { value: MeshLoDDebugView; label: string }[] = [
     { value: "selected-group", label: "Selected group" },
     { value: "page-residency", label: "Page residency" },
     { value: "requested-pages", label: "Requested pages" },
+    { value: "meshlet-cone", label: "Meshlet cone" },
 ];
 
 export interface MeshLoDControlsOptions {
@@ -25,6 +26,9 @@ export interface MeshLoDControlsOptions {
     assets: readonly MeshLoDAsset[];
     networkSim: MeshLoDNetworkSimulator;
     cameraPath: MeshLoDCameraPathController;
+    models: readonly { id: string; label: string }[];
+    selectedModelId: string;
+    onModelChange: (modelId: string) => void;
     /** Called when the debug-view selector changes (demo updates the legend and
      *  switches to CPU reference selection so all views render correctly). */
     onDebugViewChange?: (view: MeshLoDDebugView) => void;
@@ -51,7 +55,7 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLEl
 }
 
 export function installMeshLoDControls(options: MeshLoDControlsOptions): void {
-    const { container, assets, networkSim, cameraPath, onDebugViewChange } = options;
+    const { container, assets, networkSim, cameraPath, models, selectedModelId, onModelChange, onDebugViewChange } = options;
     container.replaceChildren();
 
     const status = el("div", { className: "hud-status", role: "status" });
@@ -93,6 +97,13 @@ export function installMeshLoDControls(options: MeshLoDControlsOptions): void {
         const label = el("label", { htmlFor: spec.id }, [spec.label, " ", value]);
         return el("div", { className: "hud-row" }, [label, input]);
     };
+
+    const modelSelect = el("select", { id: "meshLodModel" });
+    for (const model of models) {
+        modelSelect.append(el("option", { value: model.id, textContent: model.label, selected: model.id === selectedModelId }));
+    }
+    modelSelect.addEventListener("change", () => onModelChange(modelSelect.value));
+    const modelRow = el("div", { className: "hud-row" }, [el("label", { htmlFor: "meshLodModel" }, ["Model"]), modelSelect]);
 
     // Screen-space error: 0.5–16 px, default 2.
     const sseRow = makeSlider({
@@ -240,6 +251,7 @@ export function installMeshLoDControls(options: MeshLoDControlsOptions): void {
 
     container.append(
         el("div", { className: "hud-title", textContent: "MeshLoD controls" }),
+        modelRow,
         sseRow,
         budgetRow,
         bandwidthRow,

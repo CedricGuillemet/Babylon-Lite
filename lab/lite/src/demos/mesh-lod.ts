@@ -1,13 +1,13 @@
-// Demo — MeshLoD Statue (streaming clustered level-of-detail)
+// Demo — MeshLoD models (streaming clustered level-of-detail)
 //
-// Showcase-only page. Streams the Harvard-Yenching Institute statue as three
-// `.mlod` clustered-LOD primitives through Babylon Lite's public, opt-in MeshLoD
+// Showcase-only page. Streams selectable glTF models as `.mlod` clustered-LOD
+// primitives through Babylon Lite's public, opt-in MeshLoD
 // path: `loadMeshLoD` → `createMeshLoDInstance` → `addMeshLoDToScene`. Selection,
 // streaming, caching, and material-owned indirect rendering are all the
 // production runtime — the demo adds no loader, selector, cache, or renderer of
 // its own.
 //
-// The source statue GLB is loaded ONLY to reuse its three existing PBR materials
+// The source GLB is loaded ONLY to reuse its existing PBR materials
 // (base-colour textures) and node transforms; its ordinary meshes are never added
 // to the scene, so nothing but the MeshLoD instances renders. This is a demo
 // asset-preparation compromise, not a MeshLoD runtime dependency — application
@@ -39,6 +39,8 @@ import {
     type MeshLoDDebugView,
     type MeshLoDInstance,
     type PbrMaterialProps,
+    type AssetContainer,
+    type SceneNode,
 } from "babylon-lite";
 import { configureDemoDecoderBases, demoAssetUrl } from "./demo-asset-url.js";
 import { installFetchProgress } from "./loading-progress.js";
@@ -47,14 +49,42 @@ import { createMeshLoDCameraPath, type MeshLoDCameraPose } from "./mesh-lod-came
 import { installMeshLoDControls } from "./mesh-lod-controls.js";
 import { installMeshLoDDiagnostics } from "./mesh-lod-diagnostics.js";
 
-// The three statue primitives, in mesh-index order (mesh000 → material 0, etc.).
-const MLOD_FILES = [
-    "harvard-yenching_institute_statue.mesh000.prim000.mlod",
-    "harvard-yenching_institute_statue.mesh001.prim000.mlod",
-    "harvard-yenching_institute_statue.mesh002.prim000.mlod",
+interface MeshLoDModel {
+    id: string;
+    label: string;
+    sourceGlb: string;
+    mlodFiles: readonly string[];
+    estimatedBytes: number;
+}
+
+function primitiveFiles(base: string, count: number): string[] {
+    return Array.from({ length: count }, (_, index) => `${base}.mesh${String(index).padStart(3, "0")}.prim000.mlod`);
+}
+
+const MODELS: readonly MeshLoDModel[] = [
+    {
+        id: "harvard",
+        label: "Harvard-Yenching Institute statue",
+        sourceGlb: "harvard-yenching_institute_statue.glb",
+        mlodFiles: primitiveFiles("harvard-yenching_institute_statue", 3),
+        estimatedBytes: 20_000_000,
+    },
+    { id: "lion", label: "Lion statue", sourceGlb: "lion_statue.glb", mlodFiles: primitiveFiles("lion_statue", 11), estimatedBytes: 51_000_000 },
+    { id: "lowe", label: "Lowe", sourceGlb: "lowe.glb", mlodFiles: primitiveFiles("lowe", 13), estimatedBytes: 62_000_000 },
+    { id: "pit", label: "Pit", sourceGlb: "pit.glb", mlodFiles: primitiveFiles("pit", 15), estimatedBytes: 39_000_000 },
+    { id: "statue", label: "Statue", sourceGlb: "statue.glb", mlodFiles: primitiveFiles("statue", 5), estimatedBytes: 26_000_000 },
+    {
+        id: "generals",
+        label: "Statues of generals",
+        sourceGlb: "statues_of_generals.glb",
+        mlodFiles: primitiveFiles("statues_of_generals", 21),
+        estimatedBytes: 75_000_000,
+    },
+    { id: "detailedsphere", label: "Detailed sphere", sourceGlb: "detailedsphere.glb", mlodFiles: ["detailedsphere.mlod"], estimatedBytes: 36_000_000 },
 ];
-const SOURCE_GLB = "harvard-yenching_institute_statue.glb";
-const ENV_URL = "https://playground.babylonjs.com/textures/environment.env";
+const ENV_URL = "https://assets.babylonjs.com/core/environments/environmentSpecular.env";
+const GROUND_TEXTURE_URL = "https://assets.babylonjs.com/core/environments/backgroundGround.png";
+const SKYBOX_URL = "https://assets.babylonjs.com/core/environments/backgroundSkybox.dds";
 
 const DEG = Math.PI / 180;
 
@@ -79,6 +109,30 @@ function meshLodBase(moduleUrl: string): string {
         return new URL("/mesh-lod/", moduleUrl).href;
     }
     return new URL("./mesh-lod/", moduleUrl).href;
+}
+
+/** Connect parent links without registering the source meshes for rendering. */
+function connectContainerHierarchy(container: AssetContainer): void {
+    const connect = (node: SceneNode): void => {
+        for (const child of node.children) {
+            child.parent = node;
+            connect(child);
+        }
+    };
+    for (const entity of container.entities) {
+        if (!("lightType" in entity)) {
+            connect(entity);
+        }
+    }
+}
+
+function determinantSign(node: SceneNode): "negative" | "positive" | "zero" {
+    const m = node.worldMatrix;
+    const determinant =
+        m[0]! * (m[5]! * m[10]! - m[6]! * m[9]!) +
+        m[1]! * (m[6]! * m[8]! - m[4]! * m[10]!) +
+        m[2]! * (m[4]! * m[9]! - m[5]! * m[8]!);
+    return determinant < 0 ? "negative" : determinant > 0 ? "positive" : "zero";
 }
 
 /** Transform the 8 corners of every asset's local bounds by its instance world
@@ -117,6 +171,12 @@ function computeStatueBounds(instances: readonly MeshLoDInstance[], assets: read
 
 async function main(): Promise<void> {
     const canvas = document.getElementById("renderCanvas") as HTMLCanvasElement;
+    const requestedModel = new URLSearchParams(location.search).get("model");
+    const model = MODELS.find((candidate) => candidate.id === requestedModel) ?? MODELS[0]!;
+    const credit = document.querySelector<HTMLElement>(".credit");
+    if (credit) {
+        credit.hidden = model.id !== "harvard";
+    }
 
     // Capture the pristine fetch BEFORE installing the loading-progress wrapper,
     // then route MeshLoD's range traffic through the network simulator (which
@@ -126,28 +186,29 @@ async function main(): Promise<void> {
     // architecture §15.3: 8 MiB/s, 100 ms latency, so streaming is observable.
     const rawFetch: typeof fetch = globalThis.fetch.bind(globalThis);
     const networkSim = createMeshLoDNetworkSimulator(rawFetch, { bandwidthBytesPerSecond: 8 * 1024 * 1024, latencyMs: 100 });
-    const progress = installFetchProgress(canvas, { estimatedBytes: 20_000_000 });
+    const progress = installFetchProgress(canvas, { estimatedBytes: model.estimatedBytes });
 
     const engine = await createEngine(canvas);
     const scene = createSceneContext(engine);
-    scene.clearColor = { r: 0.043, g: 0.035, b: 0.043, a: 1 };
 
     await configureDemoDecoderBases(import.meta.url);
 
     const base = meshLodBase(import.meta.url);
 
     // Load the source GLB (materials + transforms), the environment (IBL only),
-    // and the three streamed LOD primitives together. MeshLoD fetches through the
+    // and the streamed LOD primitives together. MeshLoD fetches through the
     // network simulator so bandwidth/latency controls affect only `.mlod` traffic.
     const [container, assets] = await Promise.all([
-        loadGltf(engine, demoAssetUrl(`./mesh-lod/${SOURCE_GLB}`, import.meta.url)),
-        Promise.all(MLOD_FILES.map((file) => loadMeshLoD(engine, `${base}${file}`, { request: { fetch: networkSim.fetch } }))),
+        loadGltf(engine, demoAssetUrl(`./mesh-lod/${model.sourceGlb}`, import.meta.url)),
+        Promise.all(model.mlodFiles.map((file) => loadMeshLoD(engine, `${base}${file}`, { request: { fetch: networkSim.fetch } }))),
         loadEnvironment(scene, ENV_URL, {
-            skipSkybox: true,
-            skipGround: true,
+            groundTextureUrl: GROUND_TEXTURE_URL,
+            skyboxUrl: SKYBOX_URL,
+            skyboxSize: 1000,
             brdfUrl: demoAssetUrl("./brdf-lut.png", import.meta.url),
         }),
     ]);
+    connectContainerHierarchy(container);
 
     // Reuse the GLB's PBR materials + node transforms. The ordinary source meshes
     // are NOT added to the scene, so only the MeshLoD instances render.
@@ -159,7 +220,7 @@ async function main(): Promise<void> {
         if (!source) {
             throw new Error(`Missing source mesh for MeshLoD primitive ${i}`);
         }
-        const instance = createMeshLoDInstance(asset, source.material as unknown as PbrMaterialProps, { name: `statue-prim-${i}` });
+        const instance = createMeshLoDInstance(asset, source.material as unknown as PbrMaterialProps, { name: `${model.id}-prim-${i}` });
         // Borrow the source mesh's exact world transform (its glTF node chain);
         // the source mesh itself is never registered, so it never renders.
         instance.parent = source;
@@ -181,14 +242,7 @@ async function main(): Promise<void> {
     cam.farPlane = bounds.radius * 100;
     scene.camera = cam;
     attachControl(cam, canvas, scene);
-    setCameraLimits(
-        cam,
-        {
-            lowerRadiusLimit: bounds.radius * 0.35,
-            upperRadiusLimit: bounds.radius * 4,
-        },
-        scene
-    );
+    setCameraLimits(cam, { lowerRadiusLimit: bounds.radius * 0.35 }, scene);
 
     // Deterministic camera path + runtime controls. The path drives the camera on
     // a fixed 60 Hz clock when enabled; any manual gesture pauses it (the user then
@@ -233,6 +287,17 @@ async function main(): Promise<void> {
             assets,
             networkSim,
             cameraPath,
+            models: MODELS,
+            selectedModelId: model.id,
+            onModelChange: (modelId) => {
+                if (modelId === model.id) {
+                    return;
+                }
+                const url = new URL(location.href);
+                url.searchParams.set("model", modelId);
+                url.searchParams.delete("pathTime");
+                location.href = url.href;
+            },
             onDebugViewChange: (view: MeshLoDDebugView) => {
                 diagnostics?.setLegend(view);
                 // Debug views render through the CPU reference selection path (which
@@ -259,7 +324,10 @@ async function main(): Promise<void> {
     await startEngine(engine);
 
     canvas.dataset.sourceTriangles = String(assets.reduce((sum, a) => sum + a.metadata.sourceTriangleCount, 0));
+    canvas.dataset.model = model.id;
+    canvas.dataset.sourceGlb = model.sourceGlb;
     canvas.dataset.instanceCount = String(instances.length);
+    canvas.dataset.instanceHandedness = instances.map(determinantSign).join(",");
     canvas.dataset.camAlpha = String(cam.alpha);
     canvas.dataset.camBeta = String(cam.beta);
     canvas.dataset.camRadius = String(cam.radius);

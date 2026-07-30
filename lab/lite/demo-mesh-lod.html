@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <!-- Disable the browser's pinch-to-zoom so two-finger gestures drive the camera (pinch zoom) instead. -->
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>Babylon Lite — Demo: MeshLoD Statue</title>
+  <title>Babylon Lite — Demo: MeshLoD</title>
   <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #000; }
     /* touch-action: none lets the canvas receive raw touch gestures (pinch/drag) for camera control
@@ -61,6 +61,7 @@
     }
     .credit:hover { background: rgba(0, 0, 0, 0.7); }
     .credit b { font-weight: 600; }
+    .credit[hidden] { display: none; }
     /* Diagnostic HUD panels. Populated by the demo module (T-35 controls, T-36
        diagnostics/legend); an empty panel is collapsed so the shell shows nothing
        until its content mounts. */
@@ -125,7 +126,7 @@
   <div id="loadingOverlay" class="loading-overlay" role="status" aria-live="polite">
     <div class="loading-box">
       <div class="loading-spinner" aria-hidden="true"></div>
-      <div class="loading-label">Loading MeshLoD Statue…</div>
+      <div class="loading-label">Loading MeshLoD model…</div>
       <div class="loading-sub">Fetching source model, environment & streamed LOD pages…</div>
       <div class="loading-bar" aria-hidden="true"><div id="loadingBarFill" class="loading-bar-fill"></div></div>
       <div class="loading-size" aria-hidden="true">Estimated demo assets: 20 MB</div>

@@ -19,15 +19,28 @@ namespace mlod {
 // 64 KiB-aligned page data with pinned pages first inside bootstrapBytes. All
 // section, page, directory, and header CRC32C values are computed in dependency
 // order (header CRC with its own field zeroed; PAGE_DATA uses per-page CRCs).
-// Returns kExitSuccess or kExitWrite.
+// Provenance/fingerprint bytes are host-independent (no compiler/target
+// string): native builds emit byte-identical containers for
+// identical input/settings. Returns kExitSuccess or kExitWrite.
+int writeContainer(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
+                   const NormalizedPrimitive& primitive, const ConversionSettings& settings,
+                   const std::array<std::uint8_t, 32>& sourceDigest,
+                   std::vector<unsigned char>& out, std::ostream& err);
+
+// Native-adapter overload: maps `options` to ConversionSettings and delegates.
 int writeContainer(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
                    const NormalizedPrimitive& primitive, const ConversionOptions& options,
                    const std::array<std::uint8_t, 32>& sourceDigest,
                    std::vector<unsigned char>& out, std::ostream& err);
 
 // Canonical UTF-8 provenance JSON with lexicographically ordered keys and no
-// timestamp. Embedded in the container's PROVENANCE_JSON section and reusable by
-// external statistics.
+// timestamp or compiler/target string. Embedded in the container's
+// PROVENANCE_JSON section and reusable by external statistics.
+std::string buildProvenanceJson(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
+                                const NormalizedPrimitive& primitive,
+                                const ConversionSettings& settings);
+
+// Native-adapter overload: maps `options` to ConversionSettings and delegates.
 std::string buildProvenanceJson(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
                                 const NormalizedPrimitive& primitive,
                                 const ConversionOptions& options);

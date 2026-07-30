@@ -19,8 +19,8 @@ tags):
 | meshoptimizer | `f843aae0b3070306bd2aeef43ffcf09509fee526` |
 | cgltf | `85cd62382dfea638278962690cf515023f33ed00` |
 
-These same revisions are reported by `--version` and, in later tasks, embedded
-in the generated `.mlod` provenance.
+These same revisions are reported by `--version` and embedded in the generated
+`.mlod` provenance.
 
 ## Requirements
 
@@ -112,13 +112,17 @@ ctest --test-dir mesh-lod-tool/build --output-on-failure
 
 CTest runs in-process smoke assertions plus end-to-end checks of the built
 executable's `--help`, `--version`, pinned revisions, and unknown-argument
-handling. A clean configure/build/CTest is verified at **7/7 passing**
+handling. A clean configure/build/CTest is verified at **10/10 passing**
 (`tool_smoke`, `cli_help`, `cli_version`, `cli_version_meshoptimizer_pin`,
-`cli_version_cgltf_pin`, `cli_unknown_arg`, `format_vectors`). `tool_smoke`
+`cli_version_cgltf_pin`, `cli_unknown_arg`, `format_vectors`,
+`converter_core_contracts`, `converter_core_inspection`, and
+`converter_core_conversion`). `tool_smoke`
 (`tests/tool_tests.cpp`) covers option parsing, deterministic naming, ingestion
 and every rejection fixture, hierarchy build, and end-to-end convert /
 validate-only; `format_vectors` (`tests/format_tests.cpp`) covers the binary
-layout, CRC32C, SHA-256, and source-digest vectors.
+layout, CRC32C, SHA-256, and source-digest vectors. The `converter_core_*`
+tests cover settings, resource resolution, inspection, memory limits, and
+in-memory conversion.
 
 ## Verification
 

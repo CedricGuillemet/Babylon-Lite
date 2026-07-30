@@ -296,6 +296,7 @@ export function selectMeshLoDBatch(batch: MeshLoDSceneBatch, context: DrawUpdate
             lodHysteresis: runtime.settings.lodHysteresis,
             isPageResident,
             wasFineRequired: prior,
+            coneCull: batch.material.doubleSided !== true,
         });
         batch.priorFineRequired.set(instance._instanceId, result.fineRequired);
         selections.push({ instance, result });

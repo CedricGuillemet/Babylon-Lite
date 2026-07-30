@@ -93,6 +93,15 @@ function legendItems(view: MeshLoDDebugView): { title: string; items: HTMLElemen
                 title: "Requested pages",
                 items: [swatch("rgb(0,217,255)", "streamed in (on demand)"), swatch("rgb(255,140,0)", "queued / in-flight"), el("div", { className: "legend-note" }, ["normal material otherwise"])],
             };
+        case "meshlet-cone":
+            return {
+                title: "Meshlet cone",
+                items: [
+                    swatch("rgb(0,255,0)", "front-facing / visible"),
+                    swatch("rgb(255,0,0)", "backfacing / culled (must not render)"),
+                    el("div", { className: "legend-note" }, ["Color is the conservative cone-culling margin."]),
+                ],
+            };
         default:
             return { title: "", items: [] };
     }

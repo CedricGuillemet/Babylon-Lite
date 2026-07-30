@@ -40,9 +40,14 @@ struct SourcePart {
 // excluded by the caller (they never affect geometry output).
 std::array<std::uint8_t, 32> computeSourceDigest(const std::vector<SourcePart>& parts);
 
-// Deterministic build fingerprint over the tool version, format version, both
-// dependency revisions, compiler/target string, and canonical conversion
-// options only. It contains no timestamp or host path.
+// Deterministic, host-independent build fingerprint over the tool version,
+// format version, both dependency revisions, and canonical output-affecting
+// settings only. It contains no timestamp, host path, or compiler/target
+// string, so native compiler targets produce the same fingerprint for
+// identical settings.
+std::array<std::uint8_t, 32> computeBuildFingerprint(const ConversionSettings& settings);
+
+// Native-adapter overload: maps `options` to ConversionSettings and delegates.
 std::array<std::uint8_t, 32> computeBuildFingerprint(const ConversionOptions& options);
 
 } // namespace mlod

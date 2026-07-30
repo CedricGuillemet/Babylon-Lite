@@ -22,7 +22,15 @@ import type { DrawUpdateBatch } from "../render/renderable.js";
 import type { RenderTargetSignature } from "../engine/render-target.js";
 import { createMeshLoDError } from "./mesh-lod-errors.js";
 import type { MeshLoDFrustumPlane } from "./mesh-lod-selection-math.js";
-import { extractFrustumPlanes, maxColumnScale, perspectivePixelScale, projectSphere, sphereOutsidePlanes } from "./mesh-lod-selection-math.js";
+import {
+    extractFrustumPlanes,
+    isSimilarityTransform,
+    maxColumnScale,
+    meshLoDConeCullMargin,
+    perspectivePixelScale,
+    projectSphere,
+    sphereOutsidePlanes,
+} from "./mesh-lod-selection-math.js";
 import type {
     MeshLoDAssetRuntime,
     MeshLoDCluster,
@@ -141,6 +149,12 @@ export function packClusters(clusters: readonly MeshLoDCluster[]): Uint32Array {
         out[b + 10] = c.vertexCount;
         out[b + 11] = c.triangleCount;
         out[b + 12] = c.sourceTriangleCount;
+        if (c.normalCone) {
+            const packSnorm8 = (value: number): number => Math.round(Math.max(-1, Math.min(1, value)) * 127) & 0xff;
+            out[b + 13] = packSnorm8(c.normalCone[0]) | (packSnorm8(c.normalCone[1]) << 8) | (packSnorm8(c.normalCone[2]) << 16);
+            out[b + 14] = f32Bits(c.normalCone[3]);
+            out[b + 15] = 1;
+        }
     }
     return out;
 }
@@ -220,7 +234,7 @@ export function packInstanceRecord(f32: Float32Array, u32: Uint32Array, wordBase
     f32[wordBase + 28] = maxColumnScale(world); // bytes 112–115: maximum world scale
     u32[wordBase + 29] = visible ? 1 : 0; // bytes 116–119: visibility flags
     u32[wordBase + 30] = instanceId >>> 0; // bytes 120–123: stable instance ID
-    u32[wordBase + 31] = 0; // bytes 124–127: zero
+    u32[wordBase + 31] = isSimilarityTransform(world) ? 1 : 0;
 }
 
 // ─── Deterministic GPU selection model (WGSL mirror for Node equivalence) ──
@@ -238,6 +252,7 @@ export interface MeshLoDGpuSelectionParams {
     readonly screenSpaceError: number;
     readonly lodHysteresis: number;
     readonly levelCount: number;
+    readonly coneCull?: boolean;
 }
 
 /** Packed inputs to the GPU selection model — exactly the buffers uploaded to the
@@ -412,7 +427,8 @@ export function runMeshLoDGpuSelection(input: MeshLoDGpuSelectionModelInput): Me
             visibleGroupCount += visible[g]!;
         }
 
-        // Crack-free group-DAG cut + cluster-level culling, ascending cluster id.
+        // Crack-free group-DAG cut. Hierarchy-visible groups remain atomic so
+        // tighter cluster bounds cannot punch holes in visible coverage.
         const demandedGroups = new Set<number>();
         for (let c = 0; c < clusterCount; c++) {
             const cBase = c * CLUSTER_WORDS;
@@ -424,21 +440,22 @@ export function runMeshLoDGpuSelection(input: MeshLoDGpuSelectionModelInput): Me
             if (r !== -1 && fineRequired[r] === 1 && resident[r] === 1) {
                 continue; // finer group wanted and resident: it will draw instead
             }
-            const center: [number, number, number] = [u32ToF32(input.clusters[cBase]!), u32ToF32(input.clusters[cBase + 1]!), u32ToF32(input.clusters[cBase + 2]!)];
-            const p = projectSphere(
-                world,
-                params.cameraPos,
-                params.near,
-                params.orthographicHeight,
-                params.targetHeight,
-                worldScale,
-                pixelScale,
-                center,
-                u32ToF32(input.clusters[cBase + 3]!),
-                u32ToF32(input.clusters[cBase + 4]!)
-            );
-            if (sphereOutsidePlanes(params.frustumPlanes, p.worldCenter, p.worldRadius)) {
-                continue;
+            if (
+                params.coneCull !== false &&
+                !(params.orthographicHeight !== undefined && params.orthographicHeight > 0) &&
+                input.instancesU32[iBase + 31] !== 0 &&
+                input.clusters[cBase + 15] !== 0
+            ) {
+                const packed = input.clusters[cBase + 13]!;
+                const snorm8 = (shift: number): number => {
+                    const byte = (packed >>> shift) & 0xff;
+                    return (byte >= 0x80 ? byte - 0x100 : byte) / 127;
+                };
+                const normalCone: [number, number, number, number] = [snorm8(0), snorm8(8), snorm8(16), u32ToF32(input.clusters[cBase + 14]!)];
+                const center: [number, number, number] = [u32ToF32(input.clusters[cBase]!), u32ToF32(input.clusters[cBase + 1]!), u32ToF32(input.clusters[cBase + 2]!)];
+                if (meshLoDConeCullMargin(world, params.cameraPos, center, u32ToF32(input.clusters[cBase + 3]!), normalCone) <= 0) {
+                    continue;
+                }
             }
             if (selected.length >= maxSelected) {
                 overflow = true;
@@ -1357,6 +1374,8 @@ export interface MeshLoDGpuFrameParams {
     readonly viewProjection: ArrayLike<number>;
     /** Enable frustum culling (GPU render path); `false` disables it (planeCount = 0). */
     readonly frustumCull: boolean;
+    /** Disable for double-sided materials. */
+    readonly coneCull?: boolean;
     readonly screenSpaceError: number;
     readonly lodHysteresis: number;
     readonly levelCount: number;
@@ -1406,7 +1425,7 @@ function writeSelectionParams(
     u[48] = CONTROL_DIAG_OFFSET;
     u[49] = CONTROL_PAGE_DEMAND_OFFSET;
     u[50] = state.drawVertexCapacity; // params.control.z — expansion draw-vertex capacity
-    u[51] = 0;
+    u[51] = frame.coneCull !== false ? 1 : 0;
 }
 
 /** One selection step to replay in the shared compute pass. */

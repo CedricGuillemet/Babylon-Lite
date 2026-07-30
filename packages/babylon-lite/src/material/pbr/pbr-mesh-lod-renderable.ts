@@ -30,6 +30,7 @@ import type { MeshLoDSceneBatch } from "../../mesh-lod/mesh-lod-scene.js";
 import { driveMeshLoDStreaming, selectMeshLoDBatch } from "../../mesh-lod/mesh-lod-scene.js";
 import { createMeshLoDError } from "../../mesh-lod/mesh-lod-errors.js";
 import type { MeshLoDGpuBatchState, MeshLoDGpuFrameParams, MeshLoDGpuInstanceState, MeshLoDUpdateBatch } from "../../mesh-lod/mesh-lod-selection-gpu.js";
+import { meshLoDConeCullMargin } from "../../mesh-lod/mesh-lod-selection-math.js";
 import {
     createMeshLoDGpuBatchState,
     createMeshLoDGpuInstanceState,
@@ -40,7 +41,7 @@ import {
 } from "../../mesh-lod/mesh-lod-selection-gpu.js";
 import type { MeshLoDShaderFeatures } from "./pbr-mesh-lod-compose.js";
 import { composeMeshLoDWgsl, meshLoDShaderKey } from "./pbr-mesh-lod-compose.js";
-import { meshLoDClusterDebugAttr, meshLoDDebugModeCode, meshLoDPageRequestCode, meshLoDPageResidencyCode } from "./pbr-mesh-lod-debug.js";
+import { meshLoDClusterDebugAttr, meshLoDConeDebugAttr, meshLoDDebugModeCode, meshLoDPageRequestCode, meshLoDPageResidencyCode } from "./pbr-mesh-lod-debug.js";
 
 const DRAW_VERTEX_STRIDE = 16; // 4 × u32
 const INSTANCE_STRIDE = 128; // world mat4 (64) + 3 normal-matrix vec4 (48) + pad (16)
@@ -354,7 +355,15 @@ function updatePacketCpu(engine: EngineContext, batch: MeshLoDSceneBatch, packet
             // Per-cluster debug attribute for the active view (0 when off). Purely
             // observational — packed into the reserved draw-vertex word.
             let debugAttr = 0;
-            if (debugMode !== 0) {
+            if (debugMode === 6) {
+                const camera = context._camera;
+                const position = camera ? getCameraPosition(camera) : null;
+                const margin =
+                    position && batch.material.doubleSided !== true
+                        ? meshLoDConeCullMargin(selection.instance.worldMatrix, [position.x, position.y, position.z], cluster.center, cluster.radius, cluster.normalCone)
+                        : Number.POSITIVE_INFINITY;
+                debugAttr = meshLoDConeDebugAttr(margin);
+            } else if (debugMode !== 0) {
                 const record = runtime.pageRecords[cluster.pageId]!;
                 const depth = runtime.groups[cluster.groupId]?.depth ?? 0;
                 const residency = meshLoDPageResidencyCode(record.pinned, page.state);
@@ -416,6 +425,7 @@ function buildGpuFrame(batch: MeshLoDSceneBatch, camera: Camera, context: DrawUp
         targetHeight: context.targetHeight,
         viewProjection: getViewProjectionMatrix(camera, aspect),
         frustumCull: true, // GPU render path culls; CPU diagnostic mode keeps every cluster
+        coneCull: batch.material.doubleSided !== true,
         screenSpaceError: runtime.settings.screenSpaceError,
         lodHysteresis: runtime.settings.lodHysteresis,
         levelCount: runtime.header.levelCount,

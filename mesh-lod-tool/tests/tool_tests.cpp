@@ -3,6 +3,7 @@
 #include "hierarchy.h"
 #include "input.h"
 #include "mlod_version.h"
+#include "native_filesystem.h"
 #include "validator.h"
 
 #include <cstdint>
@@ -330,6 +331,13 @@ void testIngestion() {
            "quad normalizes");
     expect(quadNorm.hasUv && quadNorm.triangleCount() == 2, "quad has UVs and two triangles");
 
+    // Material-only extensions do not affect MeshLoD geometry conversion.
+    std::vector<mlod::SourcePrimitive> specular;
+    expect(loadFixture("specular.gltf", specular, err) == mlod::kExitSuccess,
+           "KHR_materials_specular geometry loads");
+    expect(specular.size() == 1 && specular[0].material.hasMaterial,
+           "specular material facts are accepted");
+
     // Missing file surfaces an I/O error.
     std::vector<mlod::SourcePrimitive> missing;
     expect(loadFixture("does_not_exist.gltf", missing, err) == mlod::kExitIo,
@@ -396,6 +404,14 @@ void testHierarchy() {
     expect(triangle.groups[0].terminal, "the single group is terminal");
     expect(terminalCoverage(triangle) == triangle.sourceTriangleCount,
            "single triangle terminal coverage is exact");
+    expect(triangle.clusters[0].normalConeValid, "single triangle emits a normal cone");
+    expect(std::abs(triangle.clusters[0].normalConeAxis[0]) < 0.01f &&
+               std::abs(triangle.clusters[0].normalConeAxis[1]) < 0.01f &&
+               triangle.clusters[0].normalConeAxis[2] > 0.99f,
+           "single triangle normal cone points along +Z");
+    expect(triangle.clusters[0].normalConeCutoff >= 0.0f &&
+               triangle.clusters[0].normalConeCutoff < 1.0f,
+           "single triangle normal cone has a useful cutoff");
 
     // Displaced grid: multi-level hierarchy with complete coarse coverage.
     mlod::PrimitiveHierarchy grid;
@@ -520,12 +536,59 @@ void testEndToEnd() {
     expect(!fs::exists(mixedOut) && !fs::exists(mixed0) && !fs::exists(mixed1),
            "failed multi-output leaves no files");
 
+    // External multi-file glTF resolves through the
+    // native filesystem resolver end-to-end (not just via loadSourcePrimitives).
+    const std::string externalOut = "e2e_external.mlod";
+    fs::remove(externalOut);
+    expect(convert("external/triangle.gltf", externalOut, false) == mlod::kExitSuccess,
+           "external multi-file glTF converts end to end through the native CLI adapter");
+    expect(fs::exists(externalOut), "external glTF output is published");
+    {
+        const std::vector<unsigned char> externalBytes = readFile(externalOut);
+        std::ostringstream externalErrStream;
+        expect(mlod::validateContainer(externalBytes.data(), externalBytes.size(), externalErrStream) ==
+                  mlod::kExitSuccess,
+              "external glTF output validates from disk");
+    }
+    fs::remove(externalOut);
+
+    // A publish failure (destination directory does not exist) leaves no
+    // half-written temporary behind.
+    const std::string missingDirOut = "e2e_missing_dir/grid.mlod";
+    const std::string missingDirTmp = missingDirOut + ".tmp";
+    fs::remove(missingDirTmp);
+    expect(convert("grid.gltf", missingDirOut, false) == mlod::kExitWrite,
+          "publishing into a non-existent directory fails with kExitWrite");
+    expect(!fs::exists(missingDirOut) && !fs::exists(missingDirTmp),
+          "a failed publish leaves no output file and no stray temporary");
+
     // Clean up test artifacts and any stray temporaries.
     for (const std::string& path :
          {gridOut, gridOut2, gridStats, multi0, multi1, gridOut + ".tmp", multi0 + ".tmp",
           multi1 + ".tmp"}) {
         fs::remove(path);
     }
+}
+
+void testLionHierarchyCoverage() {
+    namespace fs = std::filesystem;
+
+    const fs::path sourceRoot = fs::path(MLOD_FIXTURES_DIR).parent_path().parent_path().parent_path();
+    mlod::ConversionOptions options;
+    options.inputPath = (sourceRoot / "lion_statue.glb").string();
+    options.outputPath = "lion_mesh3.mlod";
+    options.hasMesh = true;
+    options.meshIndex = 3;
+    options.hasPrimitive = true;
+    options.primitiveIndex = 0;
+
+    std::ostringstream outStream;
+    std::ostringstream errStream;
+    fs::remove(options.outputPath);
+    expect(mlod::runConversion(options, outStream, errStream) == mlod::kExitSuccess,
+           "lion mesh 3 preserves exact hierarchy terminal coverage");
+    expect(fs::exists(options.outputPath), "lion mesh 3 output is written");
+    fs::remove(options.outputPath);
 }
 
 } // namespace
@@ -541,6 +604,7 @@ int main() {
     testIngestion();
     testHierarchy();
     testEndToEnd();
+    testLionHierarchyCoverage();
 
     if (g_failures == 0) {
         std::cout << "all mesh-lod-tool CLI tests passed\n";

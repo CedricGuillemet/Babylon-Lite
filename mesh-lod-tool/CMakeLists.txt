@@ -26,9 +26,15 @@ include(Dependencies)
 set(MLOD_COMPILER_TARGET
     "${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}-${CMAKE_SYSTEM_PROCESSOR}")
 
-add_library(mesh-lod-tool-core STATIC
-    src/cli.cpp
+# ---------------------------------------------------------------------------
+# mesh-lod-converter-core: the canonical converter implementation. It owns
+# memory input, normalization, hierarchy generation, page packing,
+# serialization, validation, hashing, statistics, and structured diagnostics.
+# ---------------------------------------------------------------------------
+add_library(mesh-lod-converter-core STATIC
     src/input.cpp
+    src/diagnostics.cpp
+    src/conversion.cpp
     src/normalize.cpp
     src/hierarchy.cpp
     src/crc32c.cpp
@@ -37,27 +43,37 @@ add_library(mesh-lod-tool-core STATIC
     src/mlod_writer.cpp
     src/validator.cpp
     src/statistics.cpp)
-target_include_directories(mesh-lod-tool-core
+target_include_directories(mesh-lod-converter-core
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_compile_definitions(mesh-lod-tool-core PUBLIC
+target_compile_definitions(mesh-lod-converter-core PUBLIC
     MLOD_TOOL_VERSION="${PROJECT_VERSION}"
     MLOD_FORMAT_VERSION_MAJOR=1
     MLOD_FORMAT_VERSION_MINOR=0
     MLOD_MESHOPTIMIZER_REV="${MLOD_MESHOPTIMIZER_REV}"
     MLOD_CGLTF_REV="${MLOD_CGLTF_REV}"
     MLOD_COMPILER_TARGET="${MLOD_COMPILER_TARGET}")
-# meshoptimizer (via mlod_clusterlod) and cgltf are linked now to prove the
-# pinned dependencies build and are reachable. Their implementation macros are
-# intentionally left undefined until later tasks consume them.
-target_link_libraries(mesh-lod-tool-core PUBLIC mlod_clusterlod mlod_cgltf)
-mlod_set_project_warnings(mesh-lod-tool-core)
+target_link_libraries(mesh-lod-converter-core PUBLIC mlod_clusterlod mlod_cgltf)
+mlod_set_project_warnings(mesh-lod-converter-core)
+mlod_set_deterministic_floating_point(mesh-lod-converter-core)
+
+# mesh-lod-native-adapter: CLI parsing, native filesystem resolution, text
+# formatting, temporary-file publication, and process exit-code mapping.
+add_library(mesh-lod-native-adapter STATIC
+    src/cli.cpp
+    src/native_filesystem.cpp)
+target_include_directories(mesh-lod-native-adapter
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(mesh-lod-native-adapter PUBLIC mesh-lod-converter-core)
+mlod_set_project_warnings(mesh-lod-native-adapter)
+mlod_set_deterministic_floating_point(mesh-lod-native-adapter)
 
 add_executable(mesh-lod-tool src/main.cpp)
-target_link_libraries(mesh-lod-tool PRIVATE mesh-lod-tool-core)
+target_link_libraries(mesh-lod-tool PRIVATE mesh-lod-native-adapter)
 mlod_set_project_warnings(mesh-lod-tool)
+mlod_set_deterministic_floating_point(mesh-lod-tool)
 
 enable_testing()
 add_subdirectory(tests)

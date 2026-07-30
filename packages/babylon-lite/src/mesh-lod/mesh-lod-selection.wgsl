@@ -102,6 +102,33 @@ fn groupPagesResident(firstPageRef: u32, pageRefCount: u32) -> bool {
   return true;
 }
 
+fn unpackSnorm8(packed: u32, shift: u32) -> f32 {
+  let byte = i32((packed >> shift) & 0xffu);
+  return f32(select(byte, byte - 256, byte >= 128)) / 127.0;
+}
+
+// Positive means potentially visible; <= 0 satisfies meshoptimizer's conservative
+// perspective backface test. Disabled for double-sided materials, orthographic
+// projection, non-similarity transforms, and clusters without a useful cone.
+fn coneCullMargin(iBase: u32, cBase: u32) -> f32 {
+  if (params.control.w == 0u || params.targetInfo.w > 0.0 ||
+      bitcast<u32>(instances[iBase + 31u]) == 0u || metaBuf[cBase + 15u] == 0u) {
+    return 1.0;
+  }
+  let packed = metaBuf[cBase + 13u];
+  let localAxis = vec3<f32>(unpackSnorm8(packed, 0u), unpackSnorm8(packed, 8u), unpackSnorm8(packed, 16u));
+  let n0 = vec3<f32>(instances[iBase + 16u], instances[iBase + 17u], instances[iBase + 18u]);
+  let n1 = vec3<f32>(instances[iBase + 20u], instances[iBase + 21u], instances[iBase + 22u]);
+  let n2 = vec3<f32>(instances[iBase + 24u], instances[iBase + 25u], instances[iBase + 26u]);
+  let axis = normalize(n0 * localAxis.x + n1 * localAxis.y + n2 * localAxis.z);
+  let center = vec3<f32>(metaF32(cBase), metaF32(cBase + 1u), metaF32(cBase + 2u));
+  let p = projectSphere(iBase, instances[iBase + 28u], center, metaF32(cBase + 3u), 0.0);
+  let view = p.worldCenter - params.cameraPos.xyz;
+  let distance = length(view);
+  let threshold = metaF32(cBase + 14u) * distance + p.worldRadius;
+  return (threshold - dot(view, axis)) / max(distance, 1.0e-20);
+}
+
 // ── 1. Hierarchy visibility: one invocation per (node, instance). Under conservative
 //    bounds a not-outside leaf's ancestors are all not-outside, so the per-leaf test
 //    equals the root-down traversal the CPU oracle performs. ──
@@ -165,8 +192,10 @@ fn evaluateGroups(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 }
 
-// ── 3. Cluster selection: one invocation per (cluster, instance). Crack-free
-//    residency cut then cluster-frustum cull; atomic-append (cluster, instance). ──
+// ── 3. Cluster selection: one invocation per (cluster, instance). Preserve the
+//    hierarchy-visible group as an atomic crack-free cut, then append
+//    (cluster, instance). A second cluster-sphere cull can disagree with the
+//    conservative group bounds and punch view-dependent holes. ──
 @compute @workgroup_size(64)
 fn selectClusters(@builtin(global_invocation_id) gid: vec3<u32>) {
   let total = params.counts.z * params.counts.x; // clusterCount * instanceCount
@@ -184,11 +213,7 @@ fn selectClusters(@builtin(global_invocation_id) gid: vec3<u32>) {
     let rs = atomicLoad(&groupState[groupStateIndex(inst, u32(r))]);
     if ((rs & GS_FINE) != 0u && (rs & GS_RESIDENT) != 0u) { return; } // finer group draws instead
   }
-  let center = vec3<f32>(metaF32(cBase), metaF32(cBase + 1u), metaF32(cBase + 2u));
-  let worldScale = instances[iBase + 28u];
-  let p = projectSphere(iBase, worldScale, center, metaF32(cBase + 3u), metaF32(cBase + 4u));
-  if (sphereOutside(p.worldCenter, p.worldRadius)) { return; }
-
+  if (coneCullMargin(iBase, cBase) <= 0.0) { return; }
   let idx = atomicAdd(&control[0], 1u); // reserve; control[0] doubles as indirect X
   if (idx < params.layout0.y) {
     selectedList[idx * 2u] = cluster;
@@ -318,4 +343,3 @@ fn finalizeDraw() {
   }
   atomicStore(&drawArgs[1], 1u); // instanceCount
 }
-

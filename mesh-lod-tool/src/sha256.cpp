@@ -151,7 +151,7 @@ std::array<std::uint8_t, 32> computeSourceDigest(const std::vector<SourcePart>& 
     return hash.finalize();
 }
 
-std::array<std::uint8_t, 32> computeBuildFingerprint(const ConversionOptions& options) {
+std::array<std::uint8_t, 32> computeBuildFingerprint(const ConversionSettings& options) {
     std::string material;
     material += "tool_version=";
     material += kToolVersion;
@@ -163,11 +163,13 @@ std::array<std::uint8_t, 32> computeBuildFingerprint(const ConversionOptions& op
     material += kMeshoptimizerRev;
     material += "\ncgltf_revision=";
     material += kCgltfRev;
-    material += "\ntarget=";
-    material += kCompilerTarget;
     material += "\n";
-    material += canonicalConversionOptions(options);
+    material += canonicalConversionSettings(options);
     return sha256(material.data(), material.size());
+}
+
+std::array<std::uint8_t, 32> computeBuildFingerprint(const ConversionOptions& options) {
+    return computeBuildFingerprint(toConversionSettings(options));
 }
 
 } // namespace mlod

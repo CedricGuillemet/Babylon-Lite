@@ -34,6 +34,72 @@ export function maxColumnScale(m: ArrayLike<number>): number {
     return Math.max(c0, c1, c2);
 }
 
+/** Whether the upper-left 3x3 is a non-degenerate similarity transform. Normal
+ *  cones remain conservative under rotation/reflection and uniform scale; they
+ *  are disabled for shear or non-uniform scale. */
+export function isSimilarityTransform(m: ArrayLike<number>): boolean {
+    const lengths = [Math.hypot(m[0]!, m[1]!, m[2]!), Math.hypot(m[4]!, m[5]!, m[6]!), Math.hypot(m[8]!, m[9]!, m[10]!)];
+    const scale = Math.max(...lengths);
+    if (!(scale > 1e-8)) {
+        return false;
+    }
+    const tolerance = scale * 1e-4;
+    if (Math.max(...lengths) - Math.min(...lengths) > tolerance) {
+        return false;
+    }
+    const dotTolerance = scale * scale * 1e-4;
+    const dot01 = m[0]! * m[4]! + m[1]! * m[5]! + m[2]! * m[6]!;
+    const dot02 = m[0]! * m[8]! + m[1]! * m[9]! + m[2]! * m[10]!;
+    const dot12 = m[4]! * m[8]! + m[5]! * m[9]! + m[6]! * m[10]!;
+    return Math.abs(dot01) <= dotTolerance && Math.abs(dot02) <= dotTolerance && Math.abs(dot12) <= dotTolerance;
+}
+
+/** Conservative perspective normal-cone margin. Positive values are visible;
+ *  zero or negative values satisfy meshoptimizer's backface rejection test. */
+export function meshLoDConeCullMargin(
+    m: ArrayLike<number>,
+    cameraPos: readonly [number, number, number],
+    center: readonly [number, number, number],
+    radius: number,
+    normalCone: readonly [number, number, number, number] | null | undefined
+): number {
+    if (!normalCone || !isSimilarityTransform(m)) {
+        return Number.POSITIVE_INFINITY;
+    }
+    const worldScale = maxColumnScale(m);
+    const wx = fadd(fadd(fmul(m[0]!, center[0]), fmul(m[4]!, center[1])), fadd(fmul(m[8]!, center[2]), m[12]!));
+    const wy = fadd(fadd(fmul(m[1]!, center[0]), fmul(m[5]!, center[1])), fadd(fmul(m[9]!, center[2]), m[13]!));
+    const wz = fadd(fadd(fmul(m[2]!, center[0]), fmul(m[6]!, center[1])), fadd(fmul(m[10]!, center[2]), m[14]!));
+
+    const n0x = fsub(fmul(m[5]!, m[10]!), fmul(m[6]!, m[9]!));
+    const n0y = fsub(fmul(m[6]!, m[8]!), fmul(m[4]!, m[10]!));
+    const n0z = fsub(fmul(m[4]!, m[9]!), fmul(m[5]!, m[8]!));
+    const n1x = fsub(fmul(m[9]!, m[2]!), fmul(m[10]!, m[1]!));
+    const n1y = fsub(fmul(m[10]!, m[0]!), fmul(m[8]!, m[2]!));
+    const n1z = fsub(fmul(m[8]!, m[1]!), fmul(m[9]!, m[0]!));
+    const n2x = fsub(fmul(m[1]!, m[6]!), fmul(m[2]!, m[5]!));
+    const n2y = fsub(fmul(m[2]!, m[4]!), fmul(m[0]!, m[6]!));
+    const n2z = fsub(fmul(m[0]!, m[5]!), fmul(m[1]!, m[4]!));
+    let ax = fadd(fadd(fmul(n0x, normalCone[0]), fmul(n1x, normalCone[1])), fmul(n2x, normalCone[2]));
+    let ay = fadd(fadd(fmul(n0y, normalCone[0]), fmul(n1y, normalCone[1])), fmul(n2y, normalCone[2]));
+    let az = fadd(fadd(fmul(n0z, normalCone[0]), fmul(n1z, normalCone[1])), fmul(n2z, normalCone[2]));
+    const axisLength = fsqrt(fadd(fadd(fmul(ax, ax), fmul(ay, ay)), fmul(az, az)));
+    if (!(axisLength > 1e-8)) {
+        return Number.POSITIVE_INFINITY;
+    }
+    ax = fdiv(ax, axisLength);
+    ay = fdiv(ay, axisLength);
+    az = fdiv(az, axisLength);
+
+    const vx = fsub(wx, cameraPos[0]);
+    const vy = fsub(wy, cameraPos[1]);
+    const vz = fsub(wz, cameraPos[2]);
+    const distance = fsqrt(fadd(fadd(fmul(vx, vx), fmul(vy, vy)), fmul(vz, vz)));
+    const dot = fadd(fadd(fmul(vx, ax), fmul(vy, ay)), fmul(vz, az));
+    const threshold = fadd(fmul(normalCone[3], distance), fmul(radius, worldScale));
+    return fdiv(fsub(threshold, dot), Math.max(distance, 1e-20));
+}
+
 /** Perspective pixel scale `targetHeight / (2 * tan(verticalFov / 2))`. */
 export function perspectivePixelScale(targetHeight: number, verticalFov: number): number {
     return fdiv(targetHeight, fmul(2, f32(Math.tan(f32(verticalFov / 2)))));

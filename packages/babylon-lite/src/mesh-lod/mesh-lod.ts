@@ -32,7 +32,7 @@ export type MeshLoDAssetState = "loading" | "ready" | "recovering" | "failed" | 
 
 export type MeshLoDSelectionMode = "cpu" | "gpu";
 
-export type MeshLoDDebugView = "none" | "meshlet-id" | "lod-depth" | "selected-group" | "page-residency" | "requested-pages";
+export type MeshLoDDebugView = "none" | "meshlet-id" | "lod-depth" | "selected-group" | "page-residency" | "requested-pages" | "meshlet-cone";
 
 /** Per-request fetch overrides applied to every range request for one asset. */
 export interface MeshLoDRequestOptions {

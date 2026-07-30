@@ -5,6 +5,7 @@
 #include "mlod_format.h"
 #include "mlod_version.h"
 #include "mlod_writer.h"
+#include "native_filesystem.h"
 #include "normalize.h"
 #include "page_packer.h"
 #include "sha256.h"
@@ -169,6 +170,31 @@ void testBuildFingerprint() {
     b.partitionSize = 16; // a conversion-affecting knob
     expect(mlod::computeBuildFingerprint(a) != mlod::computeBuildFingerprint(b),
            "build fingerprint reflects conversion options");
+
+    // The compiler/target string is diagnostic-only (native --version /
+    // version diagnostics) and must never enter the build fingerprint or
+    // .mlod provenance.
+    // Reconstruct the exact hash material WITHOUT the target string and
+    // confirm it matches computeBuildFingerprint(a) byte-for-byte: if
+    // production code ever reintroduced "target=" into the material, this
+    // comparison would fail.
+    std::string materialWithoutTarget;
+    materialWithoutTarget += "tool_version=";
+    materialWithoutTarget += mlod::kToolVersion;
+    materialWithoutTarget += "\nformat_version=";
+    materialWithoutTarget += std::to_string(mlod::kFormatMajor);
+    materialWithoutTarget += ".";
+    materialWithoutTarget += std::to_string(mlod::kFormatMinor);
+    materialWithoutTarget += "\nmeshoptimizer_revision=";
+    materialWithoutTarget += mlod::kMeshoptimizerRev;
+    materialWithoutTarget += "\ncgltf_revision=";
+    materialWithoutTarget += mlod::kCgltfRev;
+    materialWithoutTarget += "\n";
+    materialWithoutTarget += mlod::canonicalConversionOptions(a);
+    const std::array<std::uint8_t, 32> expected =
+        mlod::sha256(materialWithoutTarget.data(), materialWithoutTarget.size());
+    expect(mlod::computeBuildFingerprint(a) == expected,
+           "build fingerprint matches a hash of tool/format/dependency/settings only (no compiler target)");
 }
 
 std::string fixture(const std::string& name) {
@@ -409,6 +435,28 @@ void testWriteValidate() {
     rejects(truncated, "truncation fails validation");
 }
 
+void testProvenanceExcludesCompilerTarget() {
+    mlod::ConversionOptions options;
+    mlod::NormalizedPrimitive normalized;
+    mlod::PrimitiveHierarchy hierarchy;
+    mlod::PackedGeometry packed;
+    expect(buildPacked("triangle_indexed.gltf", options, normalized, hierarchy, packed) == mlod::kExitSuccess,
+          "triangle_indexed.gltf builds for the provenance test");
+
+    const std::string provenance = mlod::buildProvenanceJson(hierarchy, packed, normalized, options);
+    expect(provenance.find("compilerTarget") == std::string::npos,
+          "provenance JSON never embeds the compiler/target string");
+    expect(provenance.find("toolVersion") != std::string::npos, "provenance JSON still embeds the tool version");
+    expect(provenance.find("formatVersion") != std::string::npos, "provenance JSON still embeds the format version");
+
+    // Both overloads (ConversionOptions and the canonical ConversionSettings)
+    // must produce byte-identical provenance for equivalent settings.
+    const std::string provenanceFromSettings =
+        mlod::buildProvenanceJson(hierarchy, packed, normalized, mlod::toConversionSettings(options));
+    expect(provenance == provenanceFromSettings,
+          "the ConversionOptions and ConversionSettings provenance overloads agree exactly");
+}
+
 } // namespace
 
 int main() {
@@ -421,6 +469,7 @@ int main() {
     testBuildFingerprint();
     testPagePacking();
     testWriteValidate();
+    testProvenanceExcludesCompilerTarget();
 
     if (g_failures == 0) {
         std::cout << "all mesh-lod-tool format tests passed\n";

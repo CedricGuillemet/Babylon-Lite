@@ -86,6 +86,18 @@ void writeClusterRecord(unsigned char* d, const HierarchyCluster& c) {
     le::writeU16(d + cluster_record::kVertexCount, c.vertexCount);
     le::writeU16(d + cluster_record::kTriangleCount, c.triangleCount);
     le::writeU32(d + cluster_record::kSourceTriangles, c.sourceTriangles);
+    if (c.normalConeValid) {
+        std::uint32_t packedAxis = 0;
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const int quantized = static_cast<int>(std::lround(c.normalConeAxis[axis] * 127.0f));
+            packedAxis |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(
+                              static_cast<std::int8_t>(quantized)))
+                          << (axis * 8);
+        }
+        le::writeU32(d + cluster_record::kFlags, kClusterFlagNormalCone);
+        le::writeU32(d + cluster_record::kNormalCone, packedAxis);
+        le::writeF32(d + cluster_record::kConeCutoff, c.normalConeCutoff);
+    }
 }
 
 void writeNodeRecord(unsigned char* d, const HierarchyNode& n) {
@@ -132,7 +144,7 @@ struct SectionPlan {
 
 std::string buildProvenanceJson(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
                                 const NormalizedPrimitive& primitive,
-                                const ConversionOptions& options) {
+                                const ConversionSettings& options) {
     std::string json;
     json += "{";
     json += "\"boundsMax\":[";
@@ -151,8 +163,6 @@ std::string buildProvenanceJson(const PrimitiveHierarchy& hierarchy, const Packe
     appendJsonString(json, kCgltfRev);
     json += ",\"clusterCount\":";
     appendJsonUint(json, hierarchy.clusters.size());
-    json += ",\"compilerTarget\":";
-    appendJsonString(json, kCompilerTarget);
     json += ",\"formatVersion\":\"";
     appendJsonUint(json, kFormatMajor);
     json += ".";
@@ -206,8 +216,13 @@ std::string buildProvenanceJson(const PrimitiveHierarchy& hierarchy, const Packe
     return json;
 }
 
+std::string buildProvenanceJson(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
+                                const NormalizedPrimitive& primitive, const ConversionOptions& options) {
+    return buildProvenanceJson(hierarchy, packed, primitive, toConversionSettings(options));
+}
+
 int writeContainer(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
-                   const NormalizedPrimitive& primitive, const ConversionOptions& options,
+                   const NormalizedPrimitive& primitive, const ConversionSettings& options,
                    const std::array<std::uint8_t, 32>& sourceDigest,
                    std::vector<unsigned char>& out, std::ostream& err) {
     const auto fail = [&](const char* message) {
@@ -393,7 +408,7 @@ int writeContainer(const PrimitiveHierarchy& hierarchy, const PackedGeometry& pa
     le::writeU32(indexBytes + 0, hierarchy.meshIndex);
     le::writeU32(indexBytes + 4, hierarchy.primitiveIndex);
     idHash.update(indexBytes, sizeof(indexBytes));
-    const std::string canonical = canonicalConversionOptions(options);
+    const std::string canonical = canonicalConversionSettings(options);
     idHash.update(canonical.data(), canonical.size());
     const std::array<std::uint8_t, 32> hierarchyId = idHash.finalize();
 
@@ -456,6 +471,13 @@ int writeContainer(const PrimitiveHierarchy& hierarchy, const PackedGeometry& pa
     le::writeU32(h + header::kHeaderCrc, headerCrc);
 
     return kExitSuccess;
+}
+
+int writeContainer(const PrimitiveHierarchy& hierarchy, const PackedGeometry& packed,
+                   const NormalizedPrimitive& primitive, const ConversionOptions& options,
+                   const std::array<std::uint8_t, 32>& sourceDigest, std::vector<unsigned char>& out,
+                   std::ostream& err) {
+    return writeContainer(hierarchy, packed, primitive, toConversionSettings(options), sourceDigest, out, err);
 }
 
 } // namespace mlod

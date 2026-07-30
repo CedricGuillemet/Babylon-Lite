@@ -4,7 +4,7 @@
  *  and is accepted as the correctness oracle before any GPU selection. It performs
  *  deterministic per-level hierarchy traversal, conservative frustum culling,
  *  hysteretic screen-space-error group selection, the crack-free group-DAG cut with
- *  a residency-fallback term, cluster-level culling, and benefit/cost page demand.
+ *  a residency-fallback term, group-atomic cluster selection, and benefit/cost page demand.
  *
  *  All comparison-sensitive arithmetic uses `Math.fround` to emulate IEEE float32,
  *  so the oracle and the WGSL selection compute pass make identical decisions. The
@@ -13,7 +13,7 @@
 
 import type { MeshLoDCluster, MeshLoDGroup, MeshLoDHierarchyNode, MeshLoDPageRecord } from "./mesh-lod-runtime.js";
 import type { MeshLoDFrustumPlane, ProjectedSphere } from "./mesh-lod-selection-math.js";
-import { fadd, fmul, fsub, maxColumnScale, perspectivePixelScale, projectSphere, sphereOutsidePlanes } from "./mesh-lod-selection-math.js";
+import { fadd, fmul, fsub, maxColumnScale, meshLoDConeCullMargin, perspectivePixelScale, projectSphere, sphereOutsidePlanes } from "./mesh-lod-selection-math.js";
 
 export type { MeshLoDFrustumPlane } from "./mesh-lod-selection-math.js";
 
@@ -46,6 +46,8 @@ export interface MeshLoDSelectionInput {
     readonly isPageResident: (pageId: number) => boolean;
     /** Prior per-group `wasFineRequired` bits (length `groups.length`). */
     readonly wasFineRequired: Uint8Array | readonly number[];
+    /** Disable for double-sided materials. Defaults to enabled. */
+    readonly coneCull?: boolean;
 }
 
 export interface MeshLoDDesiredPage {
@@ -139,7 +141,9 @@ export function selectMeshLoDCpu(input: MeshLoDSelectionInput): MeshLoDSelection
         }
     }
 
-    // Crack-free group-DAG cut, then cluster-level culling. Ascending cluster ids.
+    // Crack-free group-DAG cut. Once a group survives hierarchy culling, keep its
+    // selected clusters atomic: a second, tighter cluster-sphere test can disagree
+    // with conservative group coverage and create view-dependent holes.
     const selected: number[] = [];
     const demandShare = new Map<number, number>();
     const demandedGroups = new Set<number>();
@@ -156,8 +160,11 @@ export function selectMeshLoDCpu(input: MeshLoDSelectionInput): MeshLoDSelection
         if (refineHere) {
             continue; // the finer group is wanted and resident: it will draw instead
         }
-        const p = project(input, worldScale, pixelScale, cluster.center, cluster.radius, cluster.error);
-        if (sphereOutsidePlanes(input.frustumPlanes, p.worldCenter, p.worldRadius)) {
+        if (
+            input.coneCull !== false &&
+            !(input.camera.orthographicHeight !== undefined && input.camera.orthographicHeight > 0) &&
+            meshLoDConeCullMargin(input.worldMatrix, input.camera.position, cluster.center, cluster.radius, cluster.normalCone) <= 0
+        ) {
             continue;
         }
         selected.push(c);

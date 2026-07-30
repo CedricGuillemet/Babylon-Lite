@@ -128,6 +128,11 @@ if (attr == 1u) { return vec4<f32>(0.0, 0.85, 1.0, 1.0); }
 if (attr == 2u) { return vec4<f32>(1.0, 0.55, 0.0, 1.0); }
 return vec4<f32>(0.0, 0.0, 0.0, -1.0);
 }
+if (mode == 6u) {
+let margin = bitcast<f32>(attr);
+let visibility = clamp(margin * 4.0, 0.0, 1.0);
+return vec4<f32>(mix(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), visibility), 1.0);
+}
 return vec4<f32>(0.0, 0.0, 0.0, -1.0);
 }`;
 

@@ -51,6 +51,10 @@ struct PackedGeometry {
 // ordering them first, and writing page references back into the hierarchy.
 // Returns kExitSuccess, or kExitValidation on a packing/limit violation.
 int packPages(PrimitiveHierarchy& hierarchy, const NormalizedPrimitive& primitive,
+              const ConversionSettings& settings, PackedGeometry& out, std::ostream& err);
+
+// Native-adapter overload: maps `options` to ConversionSettings and delegates.
+int packPages(PrimitiveHierarchy& hierarchy, const NormalizedPrimitive& primitive,
               const ConversionOptions& options, PackedGeometry& out, std::ostream& err);
 
 // Decodes a stored page back into 24-byte vertex records and u16 local indices.

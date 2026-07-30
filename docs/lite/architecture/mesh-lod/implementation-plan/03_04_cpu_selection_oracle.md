@@ -32,7 +32,7 @@ Task 3.2 supplies immutable hierarchy records. This oracle is completed before G
 3. Traverse level roots/children deterministically and conservatively frustum-cull spheres.
 4. Apply asymmetric 15% refine/coarsen boundaries using prior `wasFineRequired`.
 5. Require every group page resident before refinement; preserve coarser referencing clusters otherwise.
-6. Cluster-cull selected geometry and return ascending IDs without duplicates.
+6. Keep hierarchy-visible selected groups atomic and return ascending cluster IDs without duplicates.
 7. Compute benefit/cost priority and tie-break by ascending page ID.
 
 ## Targeted tests
@@ -55,4 +55,3 @@ Task 3.2 supplies immutable hierarchy records. This oracle is completed before G
 - [ ] No cut contains missing/duplicate regions.
 - [ ] Jitter remains stable inside hysteresis.
 - [ ] CPU oracle tests pass.
-

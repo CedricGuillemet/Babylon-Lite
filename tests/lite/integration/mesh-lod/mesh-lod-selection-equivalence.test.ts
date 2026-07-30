@@ -53,13 +53,29 @@ interface FixtureHierarchy {
         pageRefCount: number;
         terminal: boolean;
     }>;
-    clusters: Array<{ center: V3; radius: number; error: number; groupId: number; refinedGroupId: number; pageId: number; triangleCount: number }>;
+    clusters: Array<{
+        center: V3;
+        radius: number;
+        error: number;
+        groupId: number;
+        refinedGroupId: number;
+        pageId: number;
+        triangleCount: number;
+        normalCone?: [number, number, number, number];
+    }>;
     nodes: Array<{ center: V3; radius: number; error: number; groupId: number; childOffset: number; childCount: number }>;
 }
 
 const load = (name: string): unknown => JSON.parse(readFileSync(fileURLToPath(new URL(`../../unit/mesh-lod/fixtures/${name}`, import.meta.url)), "utf-8"));
 const toGroup = (g: FixtureHierarchy["groups"][number]): MeshLoDGroup => ({ ...g, pinned: g.terminal, sourceTriangleCount: 0, outputTriangleCount: 0 });
-const toCluster = (c: FixtureHierarchy["clusters"][number]): MeshLoDCluster => ({ ...c, vertexOffset: 0, indexOffset: 0, vertexCount: 0, sourceTriangleCount: 0 });
+const toCluster = (c: FixtureHierarchy["clusters"][number]): MeshLoDCluster => ({
+    ...c,
+    normalCone: c.normalCone ?? null,
+    vertexOffset: 0,
+    indexOffset: 0,
+    vertexCount: 0,
+    sourceTriangleCount: 0,
+});
 
 function toPage(storedBytes: number): MeshLoDPageRecord {
     return {
@@ -273,7 +289,53 @@ describe("MeshLoD selection equivalence — frustum boundary + incomplete reside
         expect(oracle.visibleGroupCount).toBeGreaterThan(0); // tangent sphere is not culled
     });
 
-    it("culls a cluster pushed just outside the plane, in both selectors", () => {
+    describe("MeshLoD selection equivalence — meshlet normal cones", () => {
+        const source = (load("selection-lod.json") as { hierarchy: FixtureHierarchy }).hierarchy;
+        const h: FixtureHierarchy = {
+            ...source,
+            clusters: source.clusters.map((cluster, index) => ({
+                ...cluster,
+                normalCone: index === 2 ? [0, 0, 1, 0.2] : index === 3 ? [0, 0, -1, 0.2] : undefined,
+            })),
+        };
+
+        it("culls the backfacing fine meshlet and keeps the frontfacing meshlet in both selectors", () => {
+            const scenario: Scenario = {
+                camera: { position: [0, 0, -5], verticalFov: 1.0, near: 0.1, targetWidth: 1000, targetHeight: 1000 },
+                frustumPlanes: [],
+                resident: [0, 1],
+                wasFineRequired: [0, 0],
+                screenSpaceError: 2.0,
+                lodHysteresis: 0.15,
+            };
+            const oracle = selectMeshLoDCpu(oracleInput(h, scenario));
+            const model = runMeshLoDGpuSelection(modelInput(h, scenario, new Uint32Array(1)));
+
+            expect(Array.from(oracle.selectedClusterIds)).toEqual([3]);
+            expect(sortedUnique(model.selected)).toEqual([3]);
+        });
+    });
+
+    it("keeps every cluster in a visible selected group when cluster bounds disagree", () => {
+        const mismatched: FixtureHierarchy = {
+            ...h,
+            clusters: h.clusters.map((cluster) => ({ ...cluster, center: [-100, 0, 0], radius: 0.01 })),
+        };
+        const s: Scenario = {
+            camera: cam,
+            frustumPlanes: [[1, 0, 0, 1]],
+            resident: [0, 1],
+            wasFineRequired: [0, 0],
+            screenSpaceError: 2.0,
+            lodHysteresis: 0.15,
+        };
+        const oracle = selectMeshLoDCpu(oracleInput(mismatched, s));
+        const model = runMeshLoDGpuSelection(modelInput(mismatched, s, new Uint32Array(1)));
+        expect(Array.from(oracle.selectedClusterIds)).toEqual([2, 3]);
+        expect(sortedUnique(model.selected)).toEqual([2, 3]);
+    });
+
+    it("culls a group pushed just outside the plane, in both selectors", () => {
         const world = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, -2.01, 0, 0, 1];
         const s: Scenario = { camera: cam, frustumPlanes: [[1, 0, 0, 1]], resident: [0, 1], wasFineRequired: [0, 0], screenSpaceError: 2.0, lodHysteresis: 0.15, world };
         const oracle = selectMeshLoDCpu(oracleInput(h, s));
